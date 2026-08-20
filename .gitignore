@@ -1,6 +1,5 @@
 .build/
 .agent-build/
 .tmp/
-dist/
 .swiftpm/
 .DS_Store
