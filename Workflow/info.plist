@@ -1,0 +1,521 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>bundleid</key>
+    <string>com.betterfind.workflow</string>
+    <key>category</key>
+    <string>Productivity</string>
+    <key>connections</key>
+    <dict>
+        <key>2BDF95D7-8759-46CE-AC0A-C27B9C2DAF21</key>
+        <array>
+            <dict>
+                <key>destinationuid</key>
+                <string>C2AC663B-B102-4141-B88E-EF815C395C3F</string>
+                <key>modifiers</key>
+                <integer>0</integer>
+                <key>modifiersubtext</key>
+                <string>Open the selected item</string>
+                <key>vitoclose</key>
+                <false/>
+            </dict>
+            <dict>
+                <key>destinationuid</key>
+                <string>9D68B127-4A27-49A0-88ED-790C3F9A3E03</string>
+                <key>modifiers</key>
+                <integer>1048576</integer>
+                <key>modifiersubtext</key>
+                <string>Reveal in Finder</string>
+                <key>vitoclose</key>
+                <false/>
+            </dict>
+            <dict>
+                <key>destinationuid</key>
+                <string>173C055B-0AE4-4B6E-9231-A930218CC4AF</string>
+                <key>modifiers</key>
+                <integer>524288</integer>
+                <key>modifiersubtext</key>
+                <string>Copy full path</string>
+                <key>vitoclose</key>
+                <false/>
+            </dict>
+            <dict>
+                <key>destinationuid</key>
+                <string>EE75465E-AEDC-4BCB-9069-CECD75DCBB02</string>
+                <key>modifiers</key>
+                <integer>262144</integer>
+                <key>modifiersubtext</key>
+                <string>Open folder in Terminal</string>
+                <key>vitoclose</key>
+                <true/>
+            </dict>
+        </array>
+    </dict>
+    <key>createdby</key>
+    <string>Better Find</string>
+    <key>description</key>
+    <string>Cling-powered fuzzy file and folder search without Spotlight.</string>
+    <key>disabled</key>
+    <false/>
+    <key>name</key>
+    <string>Better Find</string>
+    <key>objects</key>
+    <array>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>alfredfiltersresults</key>
+                <false/>
+                <key>alfredfiltersresultsmatchmode</key>
+                <integer>0</integer>
+                <key>argumenttreatemptyqueryasnil</key>
+                <true/>
+                <key>argumenttrimmode</key>
+                <integer>0</integer>
+                <key>argumenttype</key>
+                <integer>1</integer>
+                <key>escaping</key>
+                <integer>102</integer>
+                <key>keyword</key>
+                <string>{var:search_keyword}</string>
+                <key>queuedelaycustom</key>
+                <integer>3</integer>
+                <key>queuedelayimmediatelyinitially</key>
+                <true/>
+                <key>queuedelaymode</key>
+                <integer>0</integer>
+                <key>queuemode</key>
+                <integer>2</integer>
+                <key>runningsubtext</key>
+                <string>Searching the configured root…</string>
+                <key>script</key>
+                <string></string>
+                <key>scriptargtype</key>
+                <integer>1</integer>
+                <key>scriptfile</key>
+                <string>search.zsh</string>
+                <key>subtext</key>
+                <string>Find files and folders by name</string>
+                <key>title</key>
+                <string>Better Find</string>
+                <key>type</key>
+                <integer>8</integer>
+                <key>withspace</key>
+                <true/>
+            </dict>
+            <key>type</key>
+            <string>alfred.workflow.input.scriptfilter</string>
+            <key>uid</key>
+            <string>2BDF95D7-8759-46CE-AC0A-C27B9C2DAF21</string>
+            <key>version</key>
+            <integer>3</integer>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>openwith</key>
+                <string></string>
+                <key>sourcefile</key>
+                <string></string>
+            </dict>
+            <key>type</key>
+            <string>alfred.workflow.action.openfile</string>
+            <key>uid</key>
+            <string>C2AC663B-B102-4141-B88E-EF815C395C3F</string>
+            <key>version</key>
+            <integer>3</integer>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>path</key>
+                <string>{query}</string>
+            </dict>
+            <key>type</key>
+            <string>alfred.workflow.action.revealfile</string>
+            <key>uid</key>
+            <string>9D68B127-4A27-49A0-88ED-790C3F9A3E03</string>
+            <key>version</key>
+            <integer>1</integer>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>autopaste</key>
+                <false/>
+                <key>clipboardtext</key>
+                <string>{query}</string>
+                <key>ignoredynamicplaceholders</key>
+                <false/>
+                <key>transient</key>
+                <false/>
+            </dict>
+            <key>type</key>
+            <string>alfred.workflow.output.clipboard</string>
+            <key>uid</key>
+            <string>173C055B-0AE4-4B6E-9231-A930218CC4AF</string>
+            <key>version</key>
+            <integer>3</integer>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>concurrently</key>
+                <true/>
+                <key>escaping</key>
+                <integer>0</integer>
+                <key>script</key>
+                <string></string>
+                <key>scriptargtype</key>
+                <integer>1</integer>
+                <key>scriptfile</key>
+                <string>open-terminal.zsh</string>
+                <key>type</key>
+                <integer>8</integer>
+            </dict>
+            <key>type</key>
+            <string>alfred.workflow.action.script</string>
+            <key>uid</key>
+            <string>EE75465E-AEDC-4BCB-9069-CECD75DCBB02</string>
+            <key>version</key>
+            <integer>2</integer>
+        </dict>
+    </array>
+    <key>readme</key>
+    <string>The complete Alfred workflow guide is injected from alfred/README.md by build-workflow.sh.</string>
+    <key>uidata</key>
+    <dict>
+        <key>2BDF95D7-8759-46CE-AC0A-C27B9C2DAF21</key>
+        <dict>
+            <key>xpos</key>
+            <real>80</real>
+            <key>ypos</key>
+            <real>210</real>
+        </dict>
+        <key>C2AC663B-B102-4141-B88E-EF815C395C3F</key>
+        <dict>
+            <key>note</key>
+            <string>Return: Open</string>
+            <key>xpos</key>
+            <real>480</real>
+            <key>ypos</key>
+            <real>80</real>
+        </dict>
+        <key>9D68B127-4A27-49A0-88ED-790C3F9A3E03</key>
+        <dict>
+            <key>note</key>
+            <string>Command-Return: Reveal</string>
+            <key>xpos</key>
+            <real>480</real>
+            <key>ypos</key>
+            <real>180</real>
+        </dict>
+        <key>173C055B-0AE4-4B6E-9231-A930218CC4AF</key>
+        <dict>
+            <key>note</key>
+            <string>Option-Return: Copy path</string>
+            <key>xpos</key>
+            <real>480</real>
+            <key>ypos</key>
+            <real>280</real>
+        </dict>
+        <key>EE75465E-AEDC-4BCB-9069-CECD75DCBB02</key>
+        <dict>
+            <key>note</key>
+            <string>Control-Return: Open folder in Terminal</string>
+            <key>xpos</key>
+            <real>480</real>
+            <key>ypos</key>
+            <real>380</real>
+        </dict>
+    </dict>
+    <key>userconfigurationconfig</key>
+    <array>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <string>bf</string>
+                <key>placeholder</key>
+                <string>bf</string>
+                <key>required</key>
+                <true/>
+                <key>trim</key>
+                <true/>
+            </dict>
+            <key>description</key>
+            <string>Command typed in Alfred to start a Better Find search. Follow it with a filename or folder name.</string>
+            <key>label</key>
+            <string>Search command</string>
+            <key>type</key>
+            <string>textfield</string>
+            <key>variable</key>
+            <string>search_keyword</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <string>~</string>
+                <key>filtermode</key>
+                <integer>1</integer>
+                <key>placeholder</key>
+                <string>Choose the folder to search…</string>
+                <key>required</key>
+                <true/>
+            </dict>
+            <key>description</key>
+            <string>Starting folder for every Alfred search. The default is your home folder.</string>
+            <key>label</key>
+            <string>Search root</string>
+            <key>type</key>
+            <string>filepicker</string>
+            <key>variable</key>
+            <string>search_root</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <string>/System/Applications/Utilities/Terminal.app</string>
+                <key>filtermode</key>
+                <integer>0</integer>
+                <key>placeholder</key>
+                <string>Choose your terminal application…</string>
+                <key>required</key>
+                <true/>
+            </dict>
+            <key>description</key>
+            <string>Application opened by Control-Return on folder results. Choose an installed .app terminal bundle.</string>
+            <key>label</key>
+            <string>Terminal application</string>
+            <key>type</key>
+            <string>filepicker</string>
+            <key>variable</key>
+            <string>terminal_app</string>
+        </dict>
+
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <true/>
+                <key>required</key>
+                <false/>
+                <key>text</key>
+                <string>Search inside subfolders</string>
+            </dict>
+            <key>description</key>
+            <string>Recursively search all folders below the search root.</string>
+            <key>label</key>
+            <string>Subfolders</string>
+            <key>type</key>
+            <string>checkbox</string>
+            <key>variable</key>
+            <string>include_subfolders</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <false/>
+                <key>required</key>
+                <false/>
+                <key>text</key>
+                <string>Include hidden files and folders</string>
+            </dict>
+            <key>description</key>
+            <string>Include items whose names begin with a dot or are hidden by Finder.</string>
+            <key>label</key>
+            <string>Hidden items</string>
+            <key>type</key>
+            <string>checkbox</string>
+            <key>variable</key>
+            <string>include_hidden_files</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <false/>
+                <key>required</key>
+                <false/>
+                <key>text</key>
+                <string>Match filename case exactly</string>
+            </dict>
+            <key>description</key>
+            <string>When disabled, filename matching ignores uppercase and lowercase differences.</string>
+            <key>label</key>
+            <string>Case sensitivity</string>
+            <key>type</key>
+            <string>checkbox</string>
+            <key>variable</key>
+            <string>case_sensitive</string>
+        </dict>
+
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <true/>
+                <key>required</key>
+                <false/>
+                <key>text</key>
+                <string>Exclude protected macOS system folders</string>
+            </dict>
+            <key>description</key>
+            <string>Apply the system-folder list below when the search root is a macOS disk root.</string>
+            <key>label</key>
+            <string>System-folder safety</string>
+            <key>type</key>
+            <string>checkbox</string>
+            <key>variable</key>
+            <string>exclude_system_folders</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <string>- System
+- private
+- usr
+- bin
+- sbin
+- cores
+- dev
+- etc</string>
+                <key>required</key>
+                <true/>
+                <key>trim</key>
+                <true/>
+                <key>verticalsize</key>
+                <integer>5</integer>
+            </dict>
+            <key>description</key>
+            <string>YAML sequence of top-level folder names skipped during disk-root searches.</string>
+            <key>label</key>
+            <string>System folders</string>
+            <key>type</key>
+            <string>textarea</string>
+            <key>variable</key>
+            <string>system_folders_yaml</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <string>- "~/Library/Caches"
+- "~/Library/Containers"
+- "~/Library/Group Containers"
+- "~/Library/Application Support"
+- "~/Library/Developer"
+- "~/Library/Metadata"</string>
+                <key>required</key>
+                <true/>
+                <key>trim</key>
+                <true/>
+                <key>verticalsize</key>
+                <integer>5</integer>
+            </dict>
+            <key>description</key>
+            <string>YAML sequence of files or folders to skip. Expensive Library trees are excluded by default; use [] for none.</string>
+            <key>label</key>
+            <string>Excluded paths</string>
+            <key>type</key>
+            <string>textarea</string>
+            <key>variable</key>
+            <string>excluded_paths_yaml</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <string>100</string>
+                <key>placeholder</key>
+                <string>100</string>
+                <key>required</key>
+                <true/>
+                <key>trim</key>
+                <true/>
+            </dict>
+            <key>description</key>
+            <string>Maximum results returned per query. Use 0 for Cling's 10,000-result ceiling.</string>
+            <key>label</key>
+            <string>Result limit</string>
+            <key>type</key>
+            <string>textfield</string>
+            <key>variable</key>
+            <string>result_limit</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <string>relevance</string>
+                <key>pairs</key>
+                <array>
+                    <array>
+                        <string>Relevance</string>
+                        <string>relevance</string>
+                    </array>
+                    <array>
+                        <string>Name</string>
+                        <string>name</string>
+                    </array>
+                    <array>
+                        <string>Type</string>
+                        <string>type</string>
+                    </array>
+                    <array>
+                        <string>Path</string>
+                        <string>path</string>
+                    </array>
+                </array>
+            </dict>
+            <key>description</key>
+            <string>Field used to rank and order the results for each query.</string>
+            <key>label</key>
+            <string>Sort by</string>
+            <key>type</key>
+            <string>popupbutton</string>
+            <key>variable</key>
+            <string>sort_by</string>
+        </dict>
+        <dict>
+            <key>config</key>
+            <dict>
+                <key>default</key>
+                <string>descending</string>
+                <key>pairs</key>
+                <array>
+                    <array>
+                        <string>Ascending</string>
+                        <string>ascending</string>
+                    </array>
+                    <array>
+                        <string>Descending</string>
+                        <string>descending</string>
+                    </array>
+                </array>
+            </dict>
+            <key>description</key>
+            <string>Direction used when sorting the collected matches.</string>
+            <key>label</key>
+            <string>Sort order</string>
+            <key>type</key>
+            <string>popupbutton</string>
+            <key>variable</key>
+            <string>sort_order</string>
+        </dict>
+    </array>
+    <key>variables</key>
+    <dict/>
+    <key>variablesdontexport</key>
+    <array/>
+    <key>version</key>
+    <string>7.0.0</string>
+    <key>webaddress</key>
+    <string></string>
+</dict>
+</plist>

@@ -1,0 +1,3362 @@
+// Derived from Cling/SearchEngine.swift at commit
+// e307f37a1b148ec6389999f6d260c1df777440b4.
+// Modified for Better Find on 2026-08-17 through 2026-08-18.
+// SPDX-License-Identifier: GPL-3.0-only
+// See LICENSE and Vendor/ClingCore/UPSTREAM.md.
+
+import Foundation
+import simd
+#if canImport(Ignore)
+    import Ignore
+#endif
+import os.log
+
+private let slog = Logger(subsystem: clingSubsystem, category: "SearchEngine")
+
+// MARK: - ScoringConfig
+
+struct ScoringConfig: Codable, Equatable {
+    static let `default` = ScoringConfig()
+
+    var scoreMatch = 16
+    var gapStart = -3
+    var gapExtend = -1
+    var bonusBoundary = 8
+    var bonusNonWord = 8
+    var bonusCamel = 7
+    var bonusConsecutive = 4
+    var firstCharMultiplier = 2
+    var bonusWhitespace = 8
+    var bonusDelimiter = 9
+    var rankHasBaseBonus = 15
+    var rankPrefixMatchBonus = 20
+    var rankImportanceMultiplier = 8
+    var rankLongPathThreshold = 80
+    var basenameWastePenalty = 2
+
+    static func load() -> ScoringConfig {
+        guard let data = UserDefaults.standard.data(forKey: "scoringConfig"),
+              let config = try? JSONDecoder().decode(ScoringConfig.self, from: data)
+        else { return .default }
+        return config
+    }
+
+    static func fromJSON(_ json: String) -> ScoringConfig? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(ScoringConfig.self, from: data)
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: "scoringConfig")
+    }
+
+    func toJSON() -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(self), let str = String(data: data, encoding: .utf8) else { return "{}" }
+        return str
+    }
+
+}
+
+private var SC = ScoringConfig.load()
+
+private var scoreMatch: Int {
+    SC.scoreMatch
+}
+private var gapStart: Int {
+    SC.gapStart
+}
+private var gapExtend: Int {
+    SC.gapExtend
+}
+private var bonusBoundary: Int {
+    SC.bonusBoundary
+}
+private var bonusNonWord: Int {
+    SC.bonusNonWord
+}
+private var bonusCamel123: Int {
+    SC.bonusCamel
+}
+private var bonusConsec: Int {
+    SC.bonusConsecutive
+}
+private var firstCharMul: Int {
+    SC.firstCharMultiplier
+}
+private var bonusBdWhite: Int {
+    SC.bonusWhitespace
+}
+private var bonusBdDelim: Int {
+    SC.bonusDelimiter
+}
+
+func reloadScoringConfig() {
+    SC = ScoringConfig.load()
+    rebuildBonusFlat()
+}
+
+// MARK: - CC
+
+private enum CC: Int { case white = 0, nonWord, delim, lower, upper, letter, number }
+private let ccCount = 7
+
+private let ccTable: [CC] = {
+    var t = [CC](repeating: .nonWord, count: 256)
+    for i in 0x61 ... 0x7A {
+        t[i] = .lower
+    }
+    for i in 0x41 ... 0x5A {
+        t[i] = .upper
+    }
+    for i in 0x30 ... 0x39 {
+        t[i] = .number
+    }
+    for v: Int in [0x09, 0x0A, 0x0D, 0x20] {
+        t[v] = .white
+    }
+    for v: Int in [0x2F, 0x2D, 0x5F, 0x2E, 0x2C, 0x3A, 0x3B, 0x7C] {
+        t[v] = .delim
+    }
+    return t
+}()
+
+private func buildBonusFlat() -> [Int] {
+    func b(_ p: CC, _ c: CC) -> Int {
+        if c.rawValue > CC.nonWord.rawValue {
+            switch p {
+            case .white: return bonusBdWhite
+            case .delim: return bonusBdDelim
+            case .nonWord: return bonusBoundary
+            default: break
+            }
+        }
+        if p == .lower, c == .upper { return bonusCamel123 }
+        if p != .number, c == .number { return bonusCamel123 }
+        switch c {
+        case .nonWord, .delim: return bonusNonWord
+        case .white: return bonusBdWhite
+        default: return 0
+        }
+    }
+    var m = [Int](repeating: 0, count: ccCount * ccCount)
+    for p in 0 ..< ccCount {
+        for c in 0 ..< ccCount {
+            m[p * ccCount + c] = b(CC(rawValue: p)!, CC(rawValue: c)!)
+        }
+    }
+    return m
+}
+
+private var bonusFlat: [Int] = buildBonusFlat()
+
+private func rebuildBonusFlat() {
+    bonusFlat = buildBonusFlat()
+}
+
+// MARK: - SIMD Helpers
+
+/// Find first occurrence of `needle` byte in buffer starting at `from`, using SIMD16 (128-bit NEON).
+@inline(__always)
+private func simdFindByte(_ base: UnsafePointer<UInt8>, count: Int, needle: UInt8, from: Int) -> Int {
+    let needleVec = SIMD16<UInt8>(repeating: needle)
+    var i = from
+
+    while i &+ 16 <= count {
+        let block = UnsafeRawPointer(base + i).loadUnaligned(as: SIMD16<UInt8>.self)
+        let cmp = block .== needleVec
+        // Check if any lane matched
+        var lane = 0
+        while lane < 16 {
+            if cmp[lane] { return i &+ lane }
+            lane &+= 1
+        }
+        i &+= 16
+    }
+    while i < count {
+        if base[i] == needle { return i }
+        i &+= 1
+    }
+    return -1
+}
+
+/// SIMD-accelerated substring search: locate `needle` in `base[0..<count]` by SIMD-scanning
+/// for the first byte, then verifying the rest. Used for literal/anchor/negation operators.
+@inline(__always)
+private func simdContains(_ base: UnsafePointer<UInt8>, count: Int, needle: UnsafePointer<UInt8>, needleLen: Int) -> Bool {
+    if needleLen == 0 { return true }
+    if needleLen > count { return false }
+    let first = needle[0]
+    let limit = count &- needleLen
+    var from = 0
+    while from <= limit {
+        let pos = simdFindByte(base, count: count, needle: first, from: from)
+        if pos < 0 || pos > limit { return false }
+        var j = 1
+        var ok = true
+        while j < needleLen {
+            if base[pos &+ j] != needle[j] { ok = false; break }
+            j &+= 1
+        }
+        if ok { return true }
+        from = pos &+ 1
+    }
+    return false
+}
+
+/// `$` anchor matcher: true if `needle` is a suffix of the basename, or of the basename
+/// stem (basename minus its final `.ext`). So "icon$" matches "crank-icon.png" via the
+/// stem "crank-icon", and "icon.png$" matches via the full basename.
+@inline(__always)
+private func nameEndsWith(_ base: UnsafePointer<UInt8>, off: Int, len: Int, bnStart: Int, needle: UnsafePointer<UInt8>, needleLen: Int) -> Bool {
+    let bnLen = len &- bnStart
+    if needleLen == 0 || needleLen > bnLen { return false }
+    let bnFloor = off &+ bnStart
+    @inline(__always) func endsAt(_ end: Int) -> Bool {
+        let start = end &- needleLen
+        if start < bnFloor { return false }
+        var j = 0
+        while j < needleLen {
+            if base[start &+ j] != needle[j] { return false }
+            j &+= 1
+        }
+        return true
+    }
+    if endsAt(off &+ len) { return true }
+    // Find the final '.' within the basename (skip a leading dotfile dot).
+    var dot = -1
+    var k = off &+ len &- 1
+    while k > bnFloor {
+        if base[k] == 0x2E { dot = k; break }
+        k &-= 1
+    }
+    if dot > bnFloor { return endsAt(dot) }
+    return false
+}
+
+/// SIMD bitmask filter: check `masks[i] & qMask == qMask` for 8 entries at once.
+/// Returns number of passing indices written to `out`.
+private func simdFilterMasks(
+    _ maskPtr: UnsafePointer<UInt64>, count: Int,
+    queryMask: UInt64,
+    extIDs: UnsafePointer<UInt16>?, extTarget: UInt16,
+    filterByExt: Bool,
+    out: UnsafeMutablePointer<Int>
+) -> Int {
+    var resultCount = 0
+    let qm = SIMD8<UInt64>(repeating: queryMask)
+
+    var i = 0
+    while i &+ 8 <= count {
+        let v = UnsafeRawPointer(maskPtr + i).loadUnaligned(as: SIMD8<UInt64>.self)
+        let maskMatch = (v & qm) .== qm
+        // Check lanes
+        var anyMatch = false
+        var lane = 0
+        while lane < 8 {
+            if maskMatch[lane] { anyMatch = true; break }
+            lane &+= 1
+        }
+        if anyMatch {
+            lane = 0
+            while lane < 8 {
+                if maskMatch[lane] {
+                    let idx = i &+ lane
+                    if !filterByExt || extIDs![idx] == extTarget {
+                        out[resultCount] = idx
+                        resultCount &+= 1
+                    }
+                }
+                lane &+= 1
+            }
+        }
+        i &+= 8
+    }
+    // Scalar remainder
+    while i < count {
+        if maskPtr[i] & queryMask == queryMask {
+            if !filterByExt || extIDs![i] == extTarget {
+                out[resultCount] = i
+                resultCount &+= 1
+            }
+        }
+        i &+= 1
+    }
+    return resultCount
+}
+
+// MARK: - Byte-level Fuzzy Matcher
+
+@inline(__always) private func toLowerByte(_ b: UInt8) -> UInt8 {
+    (b >= 0x41 && b <= 0x5A) ? b &+ 32 : b
+}
+
+private func fuzzyScoreBytes(
+    _ pat: UnsafeBufferPointer<UInt8>,
+    _ txt: UnsafeBufferPointer<UInt8>,
+    boundaries: UInt64 = 0,
+    boundariesOffset: Int = 0
+) -> (score: Int, start: Int, end: Int)? {
+    let M = pat.count, N = txt.count
+    if M == 0 { return (0, 0, 0) }
+    if M > N { return nil }
+
+    let txtBase = txt.baseAddress!
+    let firstChar = pat[0]
+
+    var bestScore = Int.min
+    var bestStart = -1
+    var bestEnd = -1
+
+    // Anchor enumeration: try matching from each pat[0] occurrence and keep
+    // the best-scoring alignment. Plain leftmost-greedy misses tighter matches:
+    // e.g. "lnr" against "/users/alin/projects/lunar/..." picks 'l' in 'alin'
+    // (cross-segment, low score) and never explores 'lunar' (single-segment,
+    // boundary-aligned, much higher score).
+    var anchorFrom = 0
+    var anchorsTried = 0
+    let maxAnchors = 32
+
+    while anchorsTried < maxAnchors {
+        let anchor = simdFindByte(txtBase, count: N, needle: firstChar, from: anchorFrom)
+        if anchor < 0 { break }
+        if anchor &+ M > N { break }
+
+        // Forward greedy from this anchor
+        var pi = 1
+        var searchFrom = anchor &+ 1
+        var lastPos = anchor
+        var matched = true
+        while pi < M {
+            let pos = simdFindByte(txtBase, count: N, needle: pat[pi], from: searchFrom)
+            if pos < 0 { matched = false; break }
+            lastPos = pos
+            searchFrom = pos &+ 1
+            pi &+= 1
+        }
+        // If the suffix can't be matched from this anchor it can't be matched
+        // from any later anchor either: forward-greedy from a > anchor would
+        // either reuse the same suffix positions or skip past them.
+        if !matched { break }
+
+        let eidx = lastPos &+ 1
+        var sidx = anchor
+
+        // Backward tighten within [anchor, eidx)
+        pi = M &- 1
+        var bi = eidx &- 1
+        while bi >= anchor {
+            if txtBase[bi] == pat[pi] {
+                pi &-= 1
+                if pi < 0 { sidx = bi; break }
+            }
+            bi &-= 1
+        }
+
+        // Score the alignment within [sidx, eidx)
+        var score = 0, consecutive = 0, firstBonus = 0, inGap = false
+        var prevCC = sidx > 0 ? ccTable[Int(txt[sidx &- 1])].rawValue : CC.delim.rawValue
+        pi = 0
+        for i in sidx ..< eidx {
+            let b = txt[i]
+            let curCC = ccTable[Int(b)].rawValue
+            if toLowerByte(b) == pat[pi] {
+                score &+= scoreMatch
+                var bonus = bonusFlat[prevCC &* ccCount &+ curCC]
+                // Use precomputed boundary info to restore camelCase/delimiter bonuses lost by lowercasing
+                if boundaries != 0 {
+                    let bpos = i &- boundariesOffset
+                    if bpos >= 0, bpos < 64, boundaries & (1 << UInt64(bpos)) != 0 {
+                        bonus = max(bonus, bonusBoundary)
+                    }
+                }
+                if consecutive == 0 {
+                    firstBonus = bonus
+                } else {
+                    if bonus >= bonusBoundary, bonus > firstBonus { firstBonus = bonus }
+                    bonus = max(bonus, max(bonusConsec, firstBonus))
+                }
+                score &+= pi == 0 ? bonus &* firstCharMul : bonus
+                inGap = false; consecutive &+= 1; pi &+= 1
+            } else {
+                score &+= inGap ? gapExtend : gapStart
+                inGap = true; consecutive = 0; firstBonus = 0
+            }
+            prevCC = curCC
+        }
+
+        if score > bestScore {
+            bestScore = score
+            bestStart = sidx
+            bestEnd = eidx
+        }
+
+        anchorFrom = anchor &+ 1
+        anchorsTried &+= 1
+    }
+
+    return bestStart < 0 ? nil : (bestScore, bestStart, bestEnd)
+}
+
+// MARK: - Letter Bitmask (a-z + 0-9 + . - _)
+
+@inline(__always)
+private func letterMaskBytes(_ p: UnsafeBufferPointer<UInt8>) -> UInt64 {
+    var m: UInt64 = 0
+    for i in 0 ..< p.count {
+        let v = p[i]
+        if v >= 0x61, v <= 0x7A { m |= 1 << UInt64(v &- 0x61) }
+        else if v >= 0x30, v <= 0x39 { m |= 1 << UInt64(26 &+ v &- 0x30) }
+        else if v == 0x2E { m |= 1 << 36 }
+        else if v == 0x2D { m |= 1 << 37 }
+        else if v == 0x5F { m |= 1 << 38 }
+    }
+    return m
+}
+
+/// Split a query into space-delimited tokens, but keep a double-quoted run as a single token
+/// (quotes removed). Lets a path with spaces survive, e.g. `in:"/Users/me/My Folder"`. Single
+/// quotes are left intact so the leading-quote literal operator ('foo) is unaffected.
+private func tokenizeQuery(_ s: String) -> [String] {
+    var tokens: [String] = []
+    var cur = ""
+    var inQuote = false
+    var has = false
+    for ch in s {
+        if ch == "\"" {
+            inQuote.toggle(); has = true
+        } else if ch == " ", !inQuote {
+            if has { tokens.append(cur); cur = ""; has = false }
+        } else {
+            cur.append(ch); has = true
+        }
+    }
+    if has { tokens.append(cur) }
+    return tokens
+}
+
+// MARK: - SearchResult
+
+struct SearchResult: Comparable {
+    let path: String
+    let isDir: Bool
+    let score: Int
+    let quality: Int
+    let hasBase: Bool
+    let segmentMatches: Int // number of tokens matching at path segment boundaries (for multi-token)
+    let pathImportance: Int // 4=important dir, 3=home, 2=library, 1=system, 0=hidden
+    let prefixMatch: Bool
+    let depth: Int
+    var sourceLabel = ""
+
+    /// Composite rank combining match type, importance, and quality into a single comparable value.
+    /// hasBase and prefixMatch provide bonuses, but quality differences can overcome them.
+    /// Uses max(score, quality) so boundary-aligned matches with wider windows aren't penalized.
+    var rank: Int {
+        var r = max(score, quality)
+        if hasBase { r += SC.rankHasBaseBonus }
+        r += segmentMatches * SC.rankHasBaseBonus
+        if prefixMatch { r += SC.rankPrefixMatchBonus }
+        r += pathImportance * SC.rankImportanceMultiplier
+        r -= max(0, path.count - SC.rankLongPathThreshold)
+        return r
+    }
+
+    static func < (lhs: SearchResult, rhs: SearchResult) -> Bool {
+        let lr = lhs.rank, rr = rhs.rank
+        if lr != rr { return lr < rr }
+        if lhs.score != rhs.score { return lhs.score < rhs.score }
+        if lhs.depth != rhs.depth { return lhs.depth > rhs.depth }
+        return lhs.path.count > rhs.path.count
+    }
+}
+
+// MARK: - SearchEngine
+
+final class SearchEngine: @unchecked Sendable {
+    struct Entry {
+        var path: String
+        var isDir: Bool
+        var bnStart: Int
+        var segCount: Int
+        var pathLen: Int
+    }
+
+    private(set) var entries: [Entry] = []
+
+    private(set) var bnBoundaries: [UInt64] = [] // bit N = 1 means basename byte N is a word boundary (camelCase, delimiter, etc.)
+
+    var count: Int {
+        lock.withLock { entries.count - free.count }
+    }
+
+    // MARK: - FTS Filesystem Walker
+
+    /// Build a set of file extension patterns from an ignore file (patterns like "*.pyc", "*.o")
+    static func extractExtensionPatterns(from ignoreContent: String) -> Set<String> {
+        var exts = Set<String>()
+        for line in ignoreContent.components(separatedBy: .newlines) {
+            let p = line.trimmingCharacters(in: .whitespaces)
+            if p.hasPrefix("*."), !p.contains("/"), p.dropFirst(2).allSatisfy({ $0 != "*" }) {
+                exts.insert(String(p.dropFirst(1))) // keep the dot: ".pyc"
+            }
+        }
+        return exts
+    }
+
+    /// Path of a directory's own `.gitignore` (or `.ignore`) if present, for per-directory ignore discovery.
+    static func gitignoreFile(in dir: String) -> String? {
+        for name in [".gitignore", ".ignore"] {
+            let p = dir + "/" + name
+            if access(p, F_OK) == 0 { return p }
+        }
+        return nil
+    }
+
+    // MARK: - Capacity
+
+    func reserveCapacity(_ n: Int, avgPathLen: Int = 50) {
+        lock.withLock {
+            entries.reserveCapacity(n)
+            masks.reserveCapacity(n)
+            bnMasks.reserveCapacity(n)
+            bnBoundaries.reserveCapacity(n)
+            byteOffsets.reserveCapacity(n)
+            byteLengths.reserveCapacity(n)
+            extIDs.reserveCapacity(n)
+            allBytes.reserveCapacity(n * avgPathLen)
+        }
+    }
+
+    // MARK: - Add / Remove
+
+    /// Thread-safe add for use during parallel walks and FSEvents.
+    @discardableResult
+    func addPath(_ path: String, isDir: Bool) -> Int {
+        lock.withLock { _addPath(path, isDir: isDir) }
+    }
+
+    /// Thread-safe remove.
+    @discardableResult
+    func removePath(_ path: String) -> Bool {
+        lock.withLock { _removePath(path) }
+    }
+
+    /// Thread-safe removal of a path and every indexed descendant.
+    @discardableResult
+    func removePathAndDescendants(_ path: String) -> Int {
+        lock.withLock {
+            let prefix = path.hasSuffix("/") ? path : path + "/"
+            let paths = entries.compactMap { entry in
+                entry.path == path || entry.path.hasPrefix(prefix) ? entry.path : nil
+            }
+            var removed = 0
+            for candidate in paths where _removePath(candidate) {
+                removed &+= 1
+            }
+            return removed
+        }
+    }
+
+    func hasPath(_ path: String) -> Bool {
+        lock.withLock { ensurePathIndex(); return pathToID[path] != nil }
+    }
+
+    func clear() {
+        lock.withLock {
+            entries.removeAll()
+            masks.removeAll()
+            bnMasks.removeAll()
+            allBytes.removeAll()
+            byteOffsets.removeAll()
+            byteLengths.removeAll()
+            extIDs.removeAll()
+            extToID.removeAll()
+            extHashToID.removeAll()
+            idToExt.removeAll()
+            nextExtID = 1
+            free.removeAll()
+            pathToID.removeAll()
+            pathIndexBuilt = false
+            sortedByPath = nil
+        }
+    }
+
+    func saveBinaryIndex(to url: URL) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        lock.lock()
+        let n = entries.count
+
+        // Compute total path string bytes
+        var totalPathBytes = 0
+        var idx = 0
+        while idx < n {
+            totalPathBytes += entries[idx].path.utf8.count + 1 // +1 for null terminator
+            idx &+= 1
+        }
+
+        let headerSize = 24 // magic + entryCount + allBytesCount
+        let masksSize = n * 8
+        let bnMasksSize = n * 8
+        let bnBoundariesSize = n * 8
+        let offsetsSize = n * 4
+        let lengthsSize = n * 2
+        let bnStartsSize = n * 2
+        let segCountsSize = n
+        let isDirsSize = n
+        let totalSize = headerSize + masksSize + bnMasksSize + bnBoundariesSize + offsetsSize + lengthsSize + bnStartsSize + segCountsSize + isDirsSize + allBytes.count + totalPathBytes
+
+        var data = Data(count: totalSize)
+        data.withUnsafeMutableBytes { buf in
+            let ptr = buf.baseAddress!
+            var offset = 0
+
+            // Header
+            ptr.storeBytes(of: Self.binaryMagic, toByteOffset: offset, as: UInt64.self); offset += 8
+            ptr.storeBytes(of: UInt64(n), toByteOffset: offset, as: UInt64.self); offset += 8
+            ptr.storeBytes(of: UInt64(allBytes.count), toByteOffset: offset, as: UInt64.self); offset += 8
+
+            // Masks
+            masks.withUnsafeBufferPointer { src in _ = memcpy(ptr + offset, src.baseAddress!, n * 8) }; offset += masksSize
+            bnMasks.withUnsafeBufferPointer { src in _ = memcpy(ptr + offset, src.baseAddress!, n * 8) }; offset += bnMasksSize
+            bnBoundaries.withUnsafeBufferPointer { src in _ = memcpy(ptr + offset, src.baseAddress!, n * 8) }; offset += bnBoundariesSize
+
+            // Compact byteOffsets as UInt32
+            var i = 0
+            while i < n {
+                ptr.storeBytes(of: UInt32(byteOffsets[i]), toByteOffset: offset + i * 4, as: UInt32.self)
+                i &+= 1
+            }
+            offset += offsetsSize
+
+            // Compact byteLengths as UInt16
+            i = 0
+            while i < n {
+                ptr.storeBytes(of: UInt16(min(entries[i].pathLen, 65535)), toByteOffset: offset + i * 2, as: UInt16.self)
+                i &+= 1
+            }
+            offset += lengthsSize
+
+            // bnStarts
+            i = 0
+            while i < n {
+                ptr.storeBytes(of: UInt16(min(entries[i].bnStart, 65535)), toByteOffset: offset + i * 2, as: UInt16.self)
+                i &+= 1
+            }
+            offset += bnStartsSize
+
+            // segCounts
+            i = 0
+            while i < n {
+                (ptr + offset + i).storeBytes(of: UInt8(min(entries[i].segCount, 255)), as: UInt8.self)
+                i &+= 1
+            }
+            offset += segCountsSize
+
+            // isDirs
+            i = 0
+            while i < n {
+                (ptr + offset + i).storeBytes(of: UInt8(entries[i].isDir ? 1 : 0), as: UInt8.self)
+                i &+= 1
+            }
+            offset += isDirsSize
+
+            // allBytes
+            allBytes.withUnsafeBufferPointer { src in _ = memcpy(ptr + offset, src.baseAddress!, allBytes.count) }
+            offset += allBytes.count
+
+            // Path strings (null-terminated)
+            i = 0
+            while i < n {
+                let path = entries[i].path
+                var mutPath = path
+                mutPath.withUTF8 { utf8 in
+                    _ = memcpy(ptr + offset, utf8.baseAddress!, utf8.count)
+                    offset += utf8.count
+                }
+                (ptr + offset).storeBytes(of: UInt8(0), as: UInt8.self)
+                offset += 1
+                i &+= 1
+            }
+        }
+        lock.unlock()
+
+        try? data.write(to: url)
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        slog.info("saveBinaryIndex: \(n) entries, \(totalSize / 1_048_576)MB in \(ms, format: .fixed(precision: 1))ms")
+    }
+
+    func loadBinaryIndex(from url: URL, progress: ((Int) -> Void)? = nil) -> Bool {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+            slog.error("loadBinaryIndex: failed to read \(url.path)")
+            return false
+        }
+        let readMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+
+        let t1 = CFAbsoluteTimeGetCurrent()
+        var loaded = false
+
+        data.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress!
+            let totalLen = buf.count
+            guard totalLen > 24 else { return }
+
+            let magic = ptr.load(fromByteOffset: 0, as: UInt64.self)
+            guard magic == Self.binaryMagic else {
+                slog.error("loadBinaryIndex: bad magic")
+                return
+            }
+
+            let rawN = ptr.load(fromByteOffset: 8, as: UInt64.self)
+            let rawAllBytes = ptr.load(fromByteOffset: 16, as: UInt64.self)
+            guard let (n, allBytesCount) = Self.binaryHeaderBounds(
+                rawN: rawN, rawAllBytes: rawAllBytes, totalLen: totalLen
+            ) else {
+                slog.error("loadBinaryIndex: truncated index, n=\(rawN) allBytes=\(rawAllBytes) file=\(totalLen)B")
+                return
+            }
+
+            lock.lock()
+            let headerSize = 24
+            var offset = headerSize
+
+            // Masks: bulk memcpy
+            masks = [UInt64](repeating: 0, count: n)
+            masks.withUnsafeMutableBufferPointer { dst in _ = memcpy(dst.baseAddress!, ptr + offset, n * 8) }
+            offset += n * 8
+
+            bnMasks = [UInt64](repeating: 0, count: n)
+            bnMasks.withUnsafeMutableBufferPointer { dst in _ = memcpy(dst.baseAddress!, ptr + offset, n * 8) }
+            offset += n * 8
+
+            bnBoundaries = [UInt64](repeating: 0, count: n)
+            bnBoundaries.withUnsafeMutableBufferPointer { dst in _ = memcpy(dst.baseAddress!, ptr + offset, n * 8) }
+            offset += n * 8
+
+            progress?(n / 4)
+
+            // byteOffsets from UInt32
+            byteOffsets = [Int](repeating: 0, count: n)
+            var i = 0
+            while i < n {
+                byteOffsets[i] = Int(ptr.load(fromByteOffset: offset + i * 4, as: UInt32.self))
+                i &+= 1
+            }
+            offset += n * 4
+
+            // byteLengths from UInt16
+            byteLengths = [Int](repeating: 0, count: n)
+            var slicesValid = true
+            i = 0
+            while i < n {
+                let l = Int(ptr.load(fromByteOffset: offset + i * 2, as: UInt16.self))
+                byteLengths[i] = l
+                // extID and the scorer read allBytes[off ..< off + len] raw, so a corrupt pair walks
+                // off the end of the buffer. Checked here because both values are already in hand.
+                if byteOffsets[i] &+ l > allBytesCount { slicesValid = false; break }
+                i &+= 1
+            }
+            guard slicesValid else {
+                lock.unlock()
+                slog.error("loadBinaryIndex: entry byte range outside allBytes, \(url.path)")
+                return
+            }
+            offset += n * 2
+
+            // bnStarts
+            var bnStarts = [Int](repeating: 0, count: n)
+            i = 0
+            while i < n {
+                bnStarts[i] = Int(ptr.load(fromByteOffset: offset + i * 2, as: UInt16.self))
+                i &+= 1
+            }
+            offset += n * 2
+
+            // segCounts
+            var segCounts = [Int](repeating: 0, count: n)
+            i = 0
+            while i < n {
+                segCounts[i] = Int((ptr + offset + i).load(as: UInt8.self))
+                i &+= 1
+            }
+            offset += n
+
+            // isDirs
+            var isDirs = [Bool](repeating: false, count: n)
+            i = 0
+            while i < n {
+                isDirs[i] = (ptr + offset + i).load(as: UInt8.self) != 0
+                i &+= 1
+            }
+            offset += n
+
+            progress?(n / 2)
+
+            // allBytes: bulk memcpy
+            allBytes = [UInt8](repeating: 0, count: allBytesCount)
+            allBytes.withUnsafeMutableBufferPointer { dst in _ = memcpy(dst.baseAddress!, ptr + offset, allBytesCount) }
+            offset += allBytesCount
+
+            progress?(n * 3 / 4)
+
+            // Path strings (null-terminated)
+            entries = [Entry](repeating: Entry(path: "", isDir: false, bnStart: 0, segCount: 0, pathLen: 0), count: n)
+            i = 0
+            let strBase = (ptr + offset).assumingMemoryBound(to: UInt8.self)
+            let strEnd = totalLen - offset // the string region runs to the end of the file
+            var strOff = 0
+            var stringsValid = true
+            while i < n {
+                // Find null terminator, bounded by the region: a truncated tail would otherwise run
+                // this scan off the end of the mapping.
+                var sLen = 0
+                while strOff + sLen < strEnd, strBase[strOff + sLen] != 0 {
+                    sLen &+= 1
+                }
+                guard strOff + sLen < strEnd else { stringsValid = false; break }
+                let path = String(decoding: UnsafeBufferPointer(start: strBase + strOff, count: sLen), as: UTF8.self)
+                entries[i] = Entry(path: path, isDir: isDirs[i], bnStart: bnStarts[i], segCount: segCounts[i], pathLen: byteLengths[i])
+                strOff += sLen + 1
+                i &+= 1
+            }
+            guard stringsValid else {
+                lock.unlock()
+                slog.error("loadBinaryIndex: path strings truncated at entry \(i)/\(n), \(url.path)")
+                return
+            }
+
+            computeExtIDs()
+            pathIndexBuilt = false
+            sortedByPath = nil
+            lock.unlock()
+            loaded = true
+            progress?(n)
+        }
+
+        let parseMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000
+        let n = entries.count
+        slog.info("loadBinaryIndex: \(n) entries, read=\(readMs, format: .fixed(precision: 1))ms parse=\(parseMs, format: .fixed(precision: 1))ms")
+        return loaded
+    }
+
+    /// Append entries from a binary index file into the current engine.
+    @discardableResult
+    func appendBinaryIndex(from url: URL, progress: ((Int) -> Void)? = nil) -> Bool {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return false }
+
+        var appended = false
+        data.withUnsafeBytes { raw in
+            let ptr = raw.baseAddress!
+            let totalLen = raw.count
+            guard totalLen > 24 else { return }
+
+            let magic = ptr.load(fromByteOffset: 0, as: UInt64.self)
+            guard magic == Self.binaryMagic else { return }
+
+            let rawN = ptr.load(fromByteOffset: 8, as: UInt64.self)
+            let rawAllBytes = ptr.load(fromByteOffset: 16, as: UInt64.self)
+            guard let (n, allBytesCount) = Self.binaryHeaderBounds(
+                rawN: rawN, rawAllBytes: rawAllBytes, totalLen: totalLen
+            ) else {
+                slog.error("appendBinaryIndex: truncated index, n=\(rawN) allBytes=\(rawAllBytes) file=\(totalLen)B")
+                return
+            }
+
+            let headerSize = 24
+            var offset = headerSize
+
+            var newMasks = [UInt64](repeating: 0, count: n)
+            newMasks.withUnsafeMutableBufferPointer { dst in _ = memcpy(dst.baseAddress!, ptr + offset, n * 8) }
+            offset += n * 8
+
+            var newBnMasks = [UInt64](repeating: 0, count: n)
+            newBnMasks.withUnsafeMutableBufferPointer { dst in _ = memcpy(dst.baseAddress!, ptr + offset, n * 8) }
+            offset += n * 8
+
+            var newBnBoundaries = [UInt64](repeating: 0, count: n)
+            newBnBoundaries.withUnsafeMutableBufferPointer { dst in _ = memcpy(dst.baseAddress!, ptr + offset, n * 8) }
+            offset += n * 8
+
+            var newByteOffsets = [Int](repeating: 0, count: n)
+            var i = 0
+            while i < n {
+                newByteOffsets[i] = Int(ptr.load(fromByteOffset: offset + i * 4, as: UInt32.self))
+                i &+= 1
+            }
+            offset += n * 4
+
+            var newByteLengths = [Int](repeating: 0, count: n)
+            var slicesValid = true
+            i = 0
+            while i < n {
+                let l = Int(ptr.load(fromByteOffset: offset + i * 2, as: UInt16.self))
+                newByteLengths[i] = l
+                // Same unchecked slice into allBytes as loadBinaryIndex; see binaryHeaderBounds.
+                if newByteOffsets[i] &+ l > allBytesCount { slicesValid = false; break }
+                i &+= 1
+            }
+            guard slicesValid else {
+                slog.error("appendBinaryIndex: entry byte range outside allBytes, \(url.path)")
+                return
+            }
+            offset += n * 2
+
+            var bnStarts = [Int](repeating: 0, count: n)
+            i = 0
+            while i < n {
+                bnStarts[i] = Int(ptr.load(fromByteOffset: offset + i * 2, as: UInt16.self))
+                i &+= 1
+            }
+            offset += n * 2
+
+            var segCounts = [Int](repeating: 0, count: n)
+            i = 0
+            while i < n {
+                segCounts[i] = Int((ptr + offset + i).load(as: UInt8.self))
+                i &+= 1
+            }
+            offset += n
+
+            var isDirs = [Bool](repeating: false, count: n)
+            i = 0
+            while i < n {
+                isDirs[i] = (ptr + offset + i).load(as: UInt8.self) != 0
+                i &+= 1
+            }
+            offset += n
+
+            var newAllBytes = [UInt8](repeating: 0, count: allBytesCount)
+            newAllBytes.withUnsafeMutableBufferPointer { dst in _ = memcpy(dst.baseAddress!, ptr + offset, allBytesCount) }
+            offset += allBytesCount
+
+            var newEntries = [Entry](repeating: Entry(path: "", isDir: false, bnStart: 0, segCount: 0, pathLen: 0), count: n)
+            let strBase = (ptr + offset).assumingMemoryBound(to: UInt8.self)
+            let strEnd = totalLen - offset
+            var strOff = 0
+            var stringsValid = true
+            i = 0
+            while i < n {
+                var sLen = 0
+                while strOff + sLen < strEnd, strBase[strOff + sLen] != 0 {
+                    sLen &+= 1
+                }
+                guard strOff + sLen < strEnd else { stringsValid = false; break }
+                let path = String(decoding: UnsafeBufferPointer(start: strBase + strOff, count: sLen), as: UTF8.self)
+                newEntries[i] = Entry(path: path, isDir: isDirs[i], bnStart: bnStarts[i], segCount: segCounts[i], pathLen: newByteLengths[i])
+                strOff += sLen + 1
+                i &+= 1
+            }
+            guard stringsValid else {
+                slog.error("appendBinaryIndex: path strings truncated at entry \(i)/\(n), \(url.path)")
+                return
+            }
+
+            // Append under lock, shifting byteOffsets by current allBytes size
+            lock.lock()
+            let baseOffset = allBytes.count
+            i = 0
+            while i < n {
+                newByteOffsets[i] += baseOffset
+                i &+= 1
+            }
+            entries.append(contentsOf: newEntries)
+            masks.append(contentsOf: newMasks)
+            bnMasks.append(contentsOf: newBnMasks)
+            bnBoundaries.append(contentsOf: newBnBoundaries)
+            byteOffsets.append(contentsOf: newByteOffsets)
+            byteLengths.append(contentsOf: newByteLengths)
+            allBytes.append(contentsOf: newAllBytes)
+            computeExtIDs()
+            pathIndexBuilt = false
+            sortedByPath = nil
+            lock.unlock()
+            appended = true
+            progress?(n)
+        }
+
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        let total = lock.withLock { entries.count }
+        slog.info("appendBinaryIndex: \(url.lastPathComponent) \(total) total entries in \(ms, format: .fixed(precision: 1))ms")
+        return appended
+    }
+
+    // MARK: - Text Persistence (human-readable, used as fallback)
+
+    func saveIndex(to url: URL) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        lock.lock()
+        let entryCount = entries.count
+
+        // Write as raw bytes directly from stored data
+        var data = Data()
+        data.reserveCapacity(allBytes.count + entryCount * 4 + 20)
+        data.append(contentsOf: "cling-index-v1\n".utf8)
+
+        let dTab = UInt8(ascii: "\t")
+        let dNL = UInt8(ascii: "\n")
+        let dD = UInt8(ascii: "D")
+        let dF = UInt8(ascii: "F")
+
+        for i in 0 ..< entryCount {
+            let e = entries[i]
+            guard e.pathLen > 0 else { continue } // skip freed slots
+            data.append(e.isDir ? dD : dF)
+            data.append(dTab)
+            data.append(contentsOf: e.path.utf8)
+            data.append(dNL)
+        }
+        lock.unlock()
+
+        try? data.write(to: url)
+
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        slog.info("saveIndex: \(entryCount) entries in \(ms, format: .fixed(precision: 1))ms to \(url.path)")
+    }
+
+    /// Build pathToID from entries (call after bulk load to enable add/remove)
+    func buildPathIndex() {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        pathToID.reserveCapacity(entries.count)
+        for i in 0 ..< entries.count where !entries[i].path.isEmpty {
+            pathToID[entries[i].path] = i
+        }
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        let count = pathToID.count
+        slog.debug("buildPathIndex: \(count) entries in \(ms, format: .fixed(precision: 1))ms")
+    }
+
+    /// Build sorted path index for O(log n) prefix lookups. Call after index loading.
+    /// Holds lock for the sort (runs on background thread, never blocks main thread).
+    func buildSortedPathIndex() {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        lock.lock()
+        let n = entries.count
+        guard n > 0 else { sortedByPath = nil; lock.unlock(); return }
+
+        var sorted = [Int](unsafeUninitializedCapacity: n) {
+            buf, count in
+            var i = 0
+            while i < n {
+                buf[i] = i; i &+= 1
+            }
+            count = n
+        }
+
+        allBytes.withUnsafeBufferPointer { buf in
+            let base = buf.baseAddress!
+            sorted.sort { a, b in
+                let aOff = byteOffsets[a], aLen = byteLengths[a]
+                let bOff = byteOffsets[b], bLen = byteLengths[b]
+                let cmp = memcmp(base + aOff, base + bOff, min(aLen, bLen))
+                if cmp != 0 { return cmp < 0 }
+                return aLen < bLen
+            }
+        }
+
+        sortedByPath = sorted
+        lock.unlock()
+
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        slog.debug("buildSortedPathIndex: \(n) entries in \(ms, format: .fixed(precision: 1))ms")
+    }
+
+    func loadIndex(from url: URL, progress: ((Int) -> Void)? = nil) -> Bool {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // Memory-map the file instead of reading into Data (avoids 1.1GB copy)
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+            slog.error("loadIndex: failed to read \(url.path)")
+            return false
+        }
+        let readMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+
+        let t1 = CFAbsoluteTimeGetCurrent()
+        var entryCount = 0
+
+        data.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            let len = buf.count
+            guard len > 15 else { return }
+
+            // Verify header: "cling-index-v1\n"
+            let headerEnd = 14
+            guard len > headerEnd,
+                  base[0] == 0x63, /* c */
+                  base[6] == 0x69, /* i (in "index") */
+                  base[headerEnd] == 0x0A else { return }
+
+            // Count newlines for pre-allocation (while loop to avoid Range<Int> generic overhead in debug)
+            let t_count = CFAbsoluteTimeGetCurrent()
+            var nlCount = 0
+            var _k = 0
+            while _k < len {
+                if base[_k] == 0x0A { nlCount &+= 1 }; _k &+= 1
+            }
+            let countMs = (CFAbsoluteTimeGetCurrent() - t_count) * 1000
+            slog.debug("loadIndex: counted \(nlCount) lines in \(countMs, format: .fixed(precision: 1))ms")
+
+            lock.lock()
+            entries.reserveCapacity(nlCount)
+            masks.reserveCapacity(nlCount)
+            bnMasks.reserveCapacity(nlCount)
+            byteOffsets.reserveCapacity(nlCount)
+            byteLengths.reserveCapacity(nlCount)
+            // allBytes stores lowercased path bytes; total bytes ~ file size minus overhead
+            allBytes.reserveCapacity(len)
+
+            // Two-pass approach:
+            // Pass 1: scan lines, compute lowercased bytes + masks directly from mmap'd bytes
+            //         Store a (fileOffset, length) per entry for deferred String creation
+            // Pass 2: create Entry.path Strings in bulk
+
+            // Temp storage for file offsets (avoids String creation in hot loop)
+            var pathOffsets = [Int]() // offset into `base` where the path starts
+            var pathLens = [Int]() // length of path in bytes
+            var isDirs = [Bool]()
+            pathOffsets.reserveCapacity(nlCount)
+            pathLens.reserveCapacity(nlCount)
+            isDirs.reserveCapacity(nlCount)
+
+            var i = headerEnd + 1 // skip header line
+            while i < len {
+                var j = i
+                while j < len, base[j] != 0x0A {
+                    j &+= 1
+                }
+
+                if j - i > 2 {
+                    let isDir = base[i] == 0x44 // 'D'
+                    let pathStart = i + 2
+                    let pathLen = j - pathStart
+
+                    // Compute lowercased bytes, masks, bnStart, segCount in one pass over raw bytes
+                    let byteOff = allBytes.count
+                    var bnStart = 0, segCount = 1
+                    var mask: UInt64 = 0, bnMaskAccum: UInt64 = 0
+
+                    // Bulk-copy bytes then lowercase in-place (avoids per-byte append overhead)
+                    let copyStart = allBytes.count
+                    allBytes.append(contentsOf: UnsafeBufferPointer(start: base + pathStart, count: pathLen))
+
+                    var k = 0
+                    while k < pathLen {
+                        let b = allBytes[copyStart &+ k]
+                        let low = toLowerByte(b)
+                        if low != b { allBytes[copyStart &+ k] = low }
+
+                        if low == 0x2F {
+                            segCount &+= 1
+                            bnStart = k + 1
+                            bnMaskAccum = 0
+                        } else {
+                            var bit: UInt64 = 0
+                            if low >= 0x61, low <= 0x7A { bit = 1 << UInt64(low &- 0x61) }
+                            else if low >= 0x30, low <= 0x39 { bit = 1 << UInt64(26 &+ low &- 0x30) }
+                            else if low == 0x2E { bit = 1 << 36 }
+                            else if low == 0x2D { bit = 1 << 37 }
+                            else if low == 0x5F { bit = 1 << 38 }
+                            mask |= bit
+                            bnMaskAccum |= bit
+                        }
+                        k &+= 1
+                    }
+
+                    // Store everything except the String (deferred)
+                    pathOffsets.append(pathStart)
+                    pathLens.append(pathLen)
+                    isDirs.append(isDir)
+
+                    // Append parallel arrays (no Entry.path yet, placeholder empty string)
+                    entries.append(Entry(
+                        path: "",
+                        isDir: isDir,
+                        bnStart: bnStart,
+                        segCount: segCount,
+                        pathLen: pathLen
+                    ))
+                    masks.append(mask)
+                    bnMasks.append(bnMaskAccum)
+                    byteOffsets.append(byteOff)
+                    byteLengths.append(pathLen)
+                    let eid = allBytes.withUnsafeBufferPointer { buf in
+                        extID(for: buf.baseAddress! + byteOff, len: pathLen, bnStart: bnStart)
+                    }
+                    extIDs.append(eid)
+
+                    entryCount &+= 1
+                    if entryCount % 200_000 == 0 {
+                        progress?(entryCount)
+                    }
+                }
+                i = j + 1
+            }
+
+            // Pass 2: create String objects for Entry.path (bulk, still from mmap'd buffer)
+            let t_strings = CFAbsoluteTimeGetCurrent()
+            var idx = 0
+            while idx < entryCount {
+                entries[idx].path = String(decoding: UnsafeBufferPointer(start: base + pathOffsets[idx], count: pathLens[idx]), as: UTF8.self)
+                idx &+= 1
+            }
+            let stringMs = (CFAbsoluteTimeGetCurrent() - t_strings) * 1000
+            slog.debug("loadIndex: created \(entryCount) strings in \(stringMs, format: .fixed(precision: 1))ms")
+
+            pathIndexBuilt = false
+            sortedByPath = nil
+            lock.unlock()
+        }
+
+        let parseMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000
+        slog.info("loadIndex: \(entryCount) entries, read=\(readMs, format: .fixed(precision: 1))ms parse=\(parseMs, format: .fixed(precision: 1))ms")
+        return entryCount > 0
+    }
+
+    @discardableResult
+    func walkDirectory(
+        _ dir: String,
+        ignoreFile: String? = nil,
+        ignoreRoot: String? = nil,
+        skipDir: ((String) -> Bool)? = nil,
+        includeFile: ((String) -> Bool)? = nil,
+        applyBlocklist: Bool = false,
+        discoverGitignore: Bool = false,
+        skipGitDirectories: Bool = true,
+        progress: ((Int, String) -> Void)? = nil,
+        cancelled: (() -> Bool)? = nil
+    ) -> Int {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        let cDir = strdup(dir)!
+        defer { Darwin.free(cDir) }
+        var paths: [UnsafeMutablePointer<CChar>?] = [cDir, nil]
+
+        let opts = Int32(FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV | FTS_NOSTAT)
+        guard let ftsp = fts_open(&paths, opts, nil) else {
+            slog.error("walkDirectory: fts_open failed for \(dir)")
+            return 0
+        }
+        defer { fts_close(ftsp) }
+
+        // Pre-extract extension patterns from ignore file content for fast file-level filtering
+        let ignoreContent: String? = ignoreFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
+        let ignoredExtensions: Set<String> = ignoreContent.map { Self.extractExtensionPatterns(from: $0) } ?? []
+        let hasNegationPatterns: Bool = ignoreContent?.contains("\n!") == true || ignoreContent?.hasPrefix("!") == true
+        // Per-file blocklist checks are only needed when there are `!` exceptions (then we descend into blocked
+        // dirs and must filter their files). With no exceptions, directory pruning alone is exact, so skip it.
+        let blocklistAllows = applyBlocklist && PathBlocklist.shared.hasAllows
+
+        // The gitignore (swift-ignore / Rust `ignore` crate) panics if queried with a path that is not a
+        // descendant of the matcher's root. Two modes:
+        //  - rooted (ignoreRoot != nil): patterns anchor to `ignoreRoot` (== the walked dir) while the file
+        //    lives elsewhere (e.g. a scope ignore for /Applications stored in our cache dir).
+        //  - file-rooted (default): patterns anchor to the ignore file's own parent directory.
+        let ignoreCheck: ((String) -> Bool)? = {
+            guard let ignoreFile else { return nil }
+            if let ignoreRoot {
+                return { $0.isIgnored(in: ignoreFile, root: ignoreRoot) }
+            }
+            let parent = (ignoreFile as NSString).deletingLastPathComponent
+            guard !parent.isEmpty else { return nil }
+            let prefix = parent.hasSuffix("/") ? parent : parent + "/"
+            guard dir == parent || dir.hasPrefix(prefix) else { return nil }
+            return { $0.isIgnored(in: ignoreFile) }
+        }()
+
+        // Per-directory .gitignore/.ignore matchers, discovered as we descend (deepest last). A path is
+        // ignored if any active matcher reports it ignored (checked deepest-first, short-circuit). We pop by
+        // ancestor-prefix at point of use rather than on FTS_DP, because FTS_SKIP'd dirs emit no FTS_DP.
+        var gitignoreStack: [(file: String, ownerDir: String)] = []
+        func gitignored(_ path: String) -> Bool {
+            while let top = gitignoreStack.last, path != top.ownerDir, !path.hasPrefix(top.ownerDir + "/") {
+                gitignoreStack.removeLast()
+            }
+            for entry in gitignoreStack.reversed() where path.isIgnored(in: entry.file, root: entry.ownerDir) {
+                return true
+            }
+            return false
+        }
+
+        var added = 0
+        var skippedIgnore = 0
+        var lastProgress = t0
+
+        // Batch entries to reduce lock contention during parallel walks
+        let batchSize = 2048
+        var batch: [(String, Bool)] = []
+        batch.reserveCapacity(batchSize)
+
+        func flushBatch() {
+            guard !batch.isEmpty else { return }
+            lock.lock()
+            for (p, d) in batch {
+                _ = _addPath(p, isDir: d)
+            }
+            lock.unlock()
+            batch.removeAll(keepingCapacity: true)
+        }
+
+        while let ent = fts_read(ftsp) {
+            if cancelled?() == true { break }
+
+            let info = ent.pointee.fts_info
+            if ent.pointee.fts_level == 0 { continue }
+
+            let pathLen = Int(ent.pointee.fts_pathlen)
+            let pathPtr = UnsafeRawPointer(ent.pointee.fts_path!).assumingMemoryBound(to: UInt8.self)
+
+            switch Int32(info) {
+            case FTS_D:
+                // Skip .git unless the embedding application explicitly includes hidden trees.
+                if skipGitDirectories, ent.pointee.fts_namelen == 4 {
+                    let n = ent.pointee.fts_path!.advanced(by: pathLen &- 4)
+                    if n[0] == 0x2E, n[1] == 0x67, n[2] == 0x69, n[3] == 0x74 {
+                        fts_set(ftsp, ent, Int32(FTS_SKIP))
+                        continue
+                    }
+                }
+
+                let fullPath = String(decoding: UnsafeBufferPointer(start: pathPtr, count: pathLen), as: UTF8.self)
+
+                if let ignoreCheck, ignoreCheck(fullPath) {
+                    // When negation patterns exist (e.g. `*` + `!some/path/`), don't skip
+                    // ignored directories so that un-ignored descendants can still be visited.
+                    if !hasNegationPatterns {
+                        fts_set(ftsp, ent, Int32(FTS_SKIP))
+                    }
+                    skippedIgnore &+= 1
+                    continue
+                }
+                if applyBlocklist, pathBlockMatch(fullPath) {
+                    if !isPathBlocked(fullPath) {
+                        // An allow exception wins at this level (e.g. `!.app/Contents/MacOS/`): index and descend.
+                    } else if blocklistDirHasAllowedDescendant(fullPath) {
+                        // Blocked, but an allow-exception lives below: descend without indexing this dir.
+                        skippedIgnore &+= 1
+                        continue
+                    } else {
+                        fts_set(ftsp, ent, Int32(FTS_SKIP))
+                        skippedIgnore &+= 1
+                        continue
+                    }
+                }
+                if let skipDir, skipDir(fullPath) {
+                    fts_set(ftsp, ent, Int32(FTS_SKIP))
+                    continue
+                }
+                if discoverGitignore {
+                    // Test against ancestors' .gitignore files before pushing this dir's own.
+                    if gitignored(fullPath) {
+                        fts_set(ftsp, ent, Int32(FTS_SKIP))
+                        skippedIgnore &+= 1
+                        continue
+                    }
+                    if let gf = Self.gitignoreFile(in: fullPath) {
+                        gitignoreStack.append((gf, fullPath))
+                    }
+                }
+
+                batch.append((fullPath, true))
+                added &+= 1
+
+            case FTS_F, FTS_SL, FTS_SLNONE, FTS_NSOK:
+                // Skip .DS_Store, .localized, Icon\r
+                let nameLen = Int(ent.pointee.fts_namelen)
+                let n = ent.pointee.fts_path!.advanced(by: pathLen &- nameLen)
+                if nameLen == 9, n[0] == 0x2E, n[1] == 0x44, n[2] == 0x53,
+                   n[3] == 0x5F, n[4] == 0x53 { continue } // .DS_Store
+                if nameLen == 10, n[0] == 0x2E, n[1] == 0x6C, n[2] == 0x6F,
+                   n[3] == 0x63 { continue } // .localized
+                if nameLen == 5, n[0] == 0x49, n[1] == 0x63, n[2] == 0x6F,
+                   n[3] == 0x6E, n[4] == 0x0D { continue } // Icon\r
+
+                if !ignoredExtensions.isEmpty {
+                    var extStart = -1
+                    for k in stride(from: pathLen - 1, through: max(pathLen - 20, 0), by: -1) {
+                        let b = pathPtr[k]
+                        if b == 0x2F { break }
+                        if b == 0x2E { extStart = k; break }
+                    }
+                    if extStart >= 0 {
+                        let ext = String(decoding: UnsafeBufferPointer(start: pathPtr + extStart, count: pathLen - extStart), as: UTF8.self)
+                        if ignoredExtensions.contains(ext) {
+                            skippedIgnore &+= 1
+                            continue
+                        }
+                    }
+                }
+
+                let fullPath = String(decoding: UnsafeBufferPointer(start: pathPtr, count: pathLen), as: UTF8.self)
+                if let ignoreCheck, ignoreCheck(fullPath) {
+                    skippedIgnore &+= 1
+                    continue
+                }
+                // When blocklist exceptions exist, files are checked individually: we descend into blocked
+                // directories to reach allowed paths, so each file must be re-tested so only allowed ones get in.
+                if blocklistAllows, isPathBlocked(fullPath) {
+                    skippedIgnore &+= 1
+                    continue
+                }
+                if discoverGitignore, gitignored(fullPath) {
+                    skippedIgnore &+= 1
+                    continue
+                }
+                if let includeFile, !includeFile(fullPath) {
+                    skippedIgnore &+= 1
+                    continue
+                }
+                batch.append((fullPath, false))
+                added &+= 1
+
+            case FTS_DP: continue
+
+            default: continue
+            }
+
+            if batch.count >= batchSize { flushBatch() }
+
+            // Progress reporting (every 500ms)
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastProgress > 0.5 {
+                lastProgress = now
+                progress?(added, batch.last?.0 ?? dir)
+            }
+        }
+
+        flushBatch()
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        slog.info("walkDirectory: \(dir) added=\(added) skippedIgnore=\(skippedIgnore) in \(ms, format: .fixed(precision: 1))ms")
+        return added
+    }
+
+    /// Walk using FileManager for network/external volumes (batches directory reads, better for high-latency storage)
+    /// Supports checkpointing: saves completed top-level directories to a file so indexing can resume after a crash.
+    @discardableResult
+    func walkDirectoryURL(
+        _ dir: String,
+        ignoreFile: String? = nil,
+        skipDir: ((String) -> Bool)? = nil,
+        checkpointFile: URL? = nil,
+        progress: ((Int, String) -> Void)? = nil,
+        cancelled: (() -> Bool)? = nil
+    ) -> Int {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let fm = FileManager.default
+        let baseURL = URL(fileURLWithPath: dir)
+        let keys: [URLResourceKey] = [.isDirectoryKey, .nameKey]
+        let basePath = baseURL.path
+        let checkpointDepth = 3
+
+        let ignoreContent: String? = ignoreFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
+        let ignoredExtensions: Set<String> = ignoreContent.map { Self.extractExtensionPatterns(from: $0) } ?? []
+        let hasNegationPatterns: Bool = ignoreContent?.contains("\n!") == true || ignoreContent?.hasPrefix("!") == true
+
+        // Only apply ignore checks when the walked dir is under the ignore file's parent (see walkDirectory).
+        let ignoreRootPrefix: String? = ignoreFile.flatMap { f -> String? in
+            let parent = (f as NSString).deletingLastPathComponent
+            guard !parent.isEmpty else { return nil }
+            let prefix = parent.hasSuffix("/") ? parent : parent + "/"
+            return (dir == parent || dir.hasPrefix(prefix)) ? prefix : nil
+        }
+        let effectiveIgnoreFile: String? = ignoreRootPrefix != nil ? ignoreFile : nil
+
+        // Load completed checkpoints from previous interrupted run
+        var completedDirs = Set<String>()
+        if let cpFile = checkpointFile, let cpData = try? String(contentsOf: cpFile, encoding: .utf8) {
+            for line in cpData.components(separatedBy: "\n") where !line.isEmpty {
+                completedDirs.insert(line)
+            }
+            if !completedDirs.isEmpty {
+                slog.info("walkDirectoryURL: resuming with \(completedDirs.count) completed checkpoints")
+            }
+        }
+
+        var added = 0
+        var lastProgress = t0
+
+        let batchSize = 2048
+        var batch: [(String, Bool)] = []
+        batch.reserveCapacity(batchSize)
+
+        func flushBatch() {
+            guard !batch.isEmpty else { return }
+            lock.lock()
+            for (p, d) in batch {
+                _ = _addPath(p, isDir: d)
+            }
+            lock.unlock()
+            batch.removeAll(keepingCapacity: true)
+        }
+
+        func saveCheckpoint(_ dirPath: String) {
+            guard let cpFile = checkpointFile else { return }
+            completedDirs.insert(dirPath)
+            try? (completedDirs.joined(separator: "\n") + "\n").write(to: cpFile, atomically: true, encoding: .utf8)
+        }
+
+        func depthRelativeToBase(_ path: String) -> Int {
+            let rel = path.dropFirst(basePath.count)
+            return rel.components(separatedBy: "/").filter { !$0.isEmpty }.count
+        }
+
+        // BFS using a queue of directories to visit
+        var queue = [baseURL]
+        var qi = 0
+
+        while qi < queue.count {
+            if cancelled?() == true { break }
+
+            let dirURL = queue[qi]
+            qi += 1
+            let dirPath = dirURL.path
+
+            // Skip already-completed checkpoint dirs
+            if completedDirs.contains(dirPath) { continue }
+
+            guard let contents = try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+                continue
+            }
+
+            for url in contents {
+                if cancelled?() == true { break }
+
+                let path = url.path
+                let name = url.lastPathComponent
+
+                if name == ".DS_Store" || name == ".localized" { continue }
+                if name.hasSuffix("\r"), name.hasPrefix("Icon") { continue }
+
+                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+
+                if isDir {
+                    if name == ".git" { continue }
+                    if let effectiveIgnoreFile, path.isIgnored(in: effectiveIgnoreFile) {
+                        // When negation patterns exist, keep traversing ignored dirs
+                        // so un-ignored descendants can still be found.
+                        if hasNegationPatterns { queue.append(url) }
+                        continue
+                    }
+                    if let skipDir, skipDir(path) { continue }
+                    queue.append(url)
+                } else {
+                    if !ignoredExtensions.isEmpty {
+                        let ext = "." + (url.pathExtension.lowercased())
+                        if ext.count > 1, ignoredExtensions.contains(ext) { continue }
+                    }
+                    if let effectiveIgnoreFile, path.isIgnored(in: effectiveIgnoreFile) { continue }
+                }
+
+                batch.append((path, isDir))
+                added += 1
+
+                if batch.count >= batchSize { flushBatch() }
+
+                let now = CFAbsoluteTimeGetCurrent()
+                if now - lastProgress > 0.3 {
+                    lastProgress = now
+                    progress?(added, path)
+                }
+            }
+
+            // Checkpoint: save progress after completing top-level dirs (depth <= checkpointDepth)
+            if depthRelativeToBase(dirPath) <= checkpointDepth {
+                flushBatch()
+                saveCheckpoint(dirPath)
+            }
+        }
+
+        flushBatch()
+        // Clean up checkpoint file on successful completion
+        if let cpFile = checkpointFile, cancelled?() != true {
+            try? fm.removeItem(at: cpFile)
+        }
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        slog.info("walkDirectoryURL: \(dir) added=\(added) in \(ms, format: .fixed(precision: 1))ms")
+        return added
+    }
+
+    /// Pre-filter entries by suffix/dirsOnly, returning matching entry indices.
+    /// The result can be cached and passed to search() as candidatePool.
+    /// Holds lock for the scan (runs on background thread, never blocks main thread).
+    func prefilter(extensions: String?, dirsOnly: Bool) -> [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        let n = entries.count
+
+        // Support multiple extensions separated by space, comma, or pipe: ".png .jpeg" or ".mp4 | .mov"
+        let suffixes = extensions?
+            .replacingOccurrences(of: "|", with: " ")
+            .replacingOccurrences(of: ",", with: " ")
+            .split(separator: " ")
+            .map { String($0).lowercased() }
+            .filter { $0.hasPrefix(".") } ?? []
+        // Resolve to ext IDs where possible, keep byte arrays for unknown extensions
+        var knownExtIDs = [UInt16]()
+        var unknownSuffixBytes = [[UInt8]]()
+        for sfx in suffixes {
+            if let eid = extToID[sfx] {
+                knownExtIDs.append(eid)
+            } else {
+                unknownSuffixBytes.append(Array(sfx.utf8))
+            }
+        }
+        let hasSuffixFilter = !knownExtIDs.isEmpty || !unknownSuffixBytes.isEmpty
+
+        var result = [Int]()
+        result.reserveCapacity(n / 10)
+
+        var i = 0
+        while i < n {
+            if dirsOnly, !entries[i].isDir { i &+= 1; continue }
+            if hasSuffixFilter {
+                var matched = false
+                // Check known ext IDs (O(1) per ID)
+                if !knownExtIDs.isEmpty {
+                    let eid = extIDs[i]
+                    var ei = 0
+                    while ei < knownExtIDs.count {
+                        if eid == knownExtIDs[ei] { matched = true; break }
+                        ei &+= 1
+                    }
+                }
+                // Fallback: byte-level suffix check for unknown extensions
+                if !matched, !unknownSuffixBytes.isEmpty {
+                    let len = byteLengths[i]
+                    let off = byteOffsets[i]
+                    var si = 0
+                    while si < unknownSuffixBytes.count {
+                        let sfx = unknownSuffixBytes[si]
+                        if len >= sfx.count {
+                            var ok = true; var j = 0
+                            while j < sfx.count {
+                                if allBytes[off + len - sfx.count + j] != sfx[j] { ok = false; break }
+                                j &+= 1
+                            }
+                            if ok { matched = true; break }
+                        }
+                        si &+= 1
+                    }
+                }
+                if !matched { i &+= 1; continue }
+            }
+            result.append(i)
+            i &+= 1
+        }
+        slog.debug("prefilter: suffixes=\(suffixes) dirsOnly=\(dirsOnly) knownIDs=\(knownExtIDs.count) unknownSfx=\(unknownSuffixBytes.count) → \(result.count)/\(n) entries")
+        return result
+    }
+
+    func search(
+        query: String,
+        maxResults: Int = 200,
+        folderPrefixes: [String]? = nil,
+        excludedPrefixes: [String]? = nil,
+        excludedPaths: Set<String>? = nil,
+        suffixPattern: String? = nil,
+        dirsOnly: Bool = false,
+        maxDepth: Int? = nil,
+        candidatePool: [Int]? = nil,
+        literalDefault: Bool = false,
+        parseOperators: Bool = true,
+        cancelled: (() -> Bool)? = nil
+    ) -> [SearchResult] {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // Hold lock for the entire search to prevent concurrent array reallocation.
+        // Walkers batch 2048 entries before locking, so contention is minimal.
+        lock.lock()
+        defer { lock.unlock() }
+        let n = entries.count
+        guard n > 0 else { return [] }
+
+        let qTrimmed = query.trimmingCharacters(in: .whitespaces)
+        let qLower = qTrimmed.lowercased()
+        let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+
+        // Operator needles carry both NFD (primary, matches APFS storage) and NFC forms.
+        // A path added programmatically or from a non-APFS volume may be NFC, so an accented
+        // literal/anchor needle must be tried in both forms — mirroring the fuzzy path's NFC
+        // fallback (qAltBytes).
+        typealias OpNeedle = (nfd: [UInt8], nfc: [UInt8]?)
+        @inline(__always) func opNeedle(_ s: String) -> OpNeedle {
+            // Compare the UTF-8 BYTES, not the Strings: String == uses Unicode canonical
+            // equivalence, so a composed vs decomposed string compares equal and would hide
+            // the very difference we need the NFC fallback for.
+            let nfd = Array(s.decomposedStringWithCanonicalMapping.utf8)
+            let nfc = Array(s.precomposedStringWithCanonicalMapping.utf8)
+            return (nfd, nfc != nfd ? nfc : nil)
+        }
+        /// Letters guaranteed present in EVERY normalization form (intersection), so the candidate
+        /// prefilter / negation gate never drops a path that differs only by NFC/NFD spelling.
+        @inline(__always) func needleMask(_ n: OpNeedle) -> UInt64 {
+            let m1 = n.nfd.withUnsafeBufferPointer { letterMaskBytes($0) }
+            guard let alt = n.nfc else { return m1 }
+            return m1 & alt.withUnsafeBufferPointer { letterMaskBytes($0) }
+        }
+
+        // Positive token buckets (existing semantics)
+        var inPrefixes: [String] = []
+        var queryDepths: [Int] = []
+        var extStrings: [String] = [] // ".pdf"
+        var dirSegStrings: [String] = [] // "rcmd/"
+        var fuzzyTokens: [String] = []
+        // Operator buckets (fzf-style)
+        var litSubstrings: [OpNeedle] = [] // 'foo  → required contiguous substring
+        var anchorStarts: [OpNeedle] = [] // ^foo or /foo → required substring "/foo"
+        var anchorEnds: [OpNeedle] = [] // foo$ → name ends with foo (extension optional)
+        var negSubstrings: [OpNeedle] = [] // !foo, !foo/, !/x/ → reject if substring present
+        var negExtStrings: [String] = [] // !.py → reject by extension
+        var negAnchorStarts: [OpNeedle] = []
+        var negAnchorEnds: [OpNeedle] = []
+        var filesOnly = false // !/ → exclude directories
+
+        let queryTokens = parseOperators
+            ? tokenizeQuery(qLower)
+            : qLower.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        for rawTok in queryTokens {
+            var t = String(rawTok)
+            if !parseOperators {
+                if literalDefault { litSubstrings.append(opNeedle(t)) }
+                fuzzyTokens.append(t)
+                continue
+            }
+            // Negation sigil (leading '!')
+            var negate = false
+            if t.hasPrefix("!") {
+                if t.count == 1 { fuzzyTokens.append("!"); continue } // bare "!" is literal text
+                negate = true; t = String(t.dropFirst())
+            }
+            if negate, t == "/" { filesOnly = true; continue }
+
+            // Folder-scope / depth tokens (positive only)
+            if !negate, t.hasPrefix("in:"), t.count > 3 {
+                var path = String(t.dropFirst(3))
+                if path.hasPrefix("~") { path = homePath + path.dropFirst() }
+                while path.count > 1, path.hasSuffix("/") {
+                    path = String(path.dropLast())
+                }
+                // Mirror macOS firmlinks: /tmp, /var, /etc are exposed both as themselves and
+                // under /private. Index stores the resolved /private/* form, so add it.
+                if path == "/tmp" || path == "/var" || path == "/etc"
+                    || path.hasPrefix("/tmp/") || path.hasPrefix("/var/") || path.hasPrefix("/etc/")
+                {
+                    inPrefixes.append(path); inPrefixes.append("/private" + path)
+                } else if path == "/private/tmp" || path == "/private/var" || path == "/private/etc"
+                    || path.hasPrefix("/private/tmp/") || path.hasPrefix("/private/var/") || path.hasPrefix("/private/etc/")
+                {
+                    inPrefixes.append(path); inPrefixes.append(String(path.dropFirst("/private".count)))
+                } else {
+                    inPrefixes.append(path)
+                }
+                continue
+            }
+            if !negate, t.hasPrefix("depth:"), t.count > 6 {
+                if let d = Int(t.dropFirst(6)) { queryDepths.append(d) }
+                continue
+            }
+
+            // Anchor sigils: trailing '$' (end), leading '^'/single-segment '/' (start), leading '\'' (quote).
+            var anchorEnd = false
+            if t.hasSuffix("$"), t.count > 1 { anchorEnd = true; t = String(t.dropLast()) }
+            var anchorStart = false
+            var quoted = false
+            if t.hasPrefix("'"), t.count > 1 {
+                quoted = true; t = String(t.dropFirst())
+            } else if t.hasPrefix("^"), t.count > 1 {
+                anchorStart = true; t = String(t.dropFirst())
+            } else if t.hasPrefix("/") {
+                let rest = String(t.dropFirst())
+                if !rest.isEmpty, !rest.contains("/") {
+                    anchorStart = true; t = rest // single-segment /foo → start anchor
+                } else {
+                    while t.hasPrefix("/") {
+                        t = String(t.dropFirst())
+                    } // legacy: strip leading slashes
+                }
+            }
+            if t.isEmpty { continue }
+            let body = t
+
+            if anchorStart || anchorEnd {
+                if anchorStart {
+                    let b = opNeedle("/" + body)
+                    if negate { negAnchorStarts.append(b) } else { anchorStarts.append(b) }
+                }
+                if anchorEnd {
+                    let b = opNeedle(body)
+                    if negate { negAnchorEnds.append(b) } else { anchorEnds.append(b) }
+                }
+                continue
+            }
+
+            // Extension / dir-segment classifiers are skipped for a quoted body so the quote
+            // operator always treats it as plain text (e.g. "'.tar", "'photos/").
+            if !quoted, body.hasPrefix("."), body.count > 1 {
+                if negate { negExtStrings.append(body) } else { extStrings.append(body) }
+                continue
+            }
+            if !quoted, body.hasPrefix("*."), body.count > 2 {
+                let ext = "." + body.dropFirst(2)
+                if negate { negExtStrings.append(ext) } else { extStrings.append(ext) }
+                continue
+            }
+            if !quoted, body.hasSuffix("/"), body.count > 1 {
+                if negate { negSubstrings.append(opNeedle(body)) } else { dirSegStrings.append(body) }
+                continue
+            }
+            // Plain word: fuzzy by default, literal substring when quoted or negated. The quote
+            // flips whichever mode is NOT the default, so under literalDefault a bareword is the
+            // literal one and 'foo is the fuzzy escape hatch (like fzf's --exact).
+            if negate { negSubstrings.append(opNeedle(body)) }
+            else if literalDefault != quoted {
+                litSubstrings.append(opNeedle(body))
+                // A bareword under literalDefault also feeds the fuzzy scorer: the substring gate
+                // above decides WHICH paths match, the score only ranks them. Without it a literal
+                // query loses every ranking signal (basename hit, prefix, tightness) and falls back
+                // to path importance alone. Contiguous text always matches as a subsequence, so
+                // this never widens the result set. Explicit 'foo keeps its pure-gate semantics
+                // (order-independent across several quoted words) untouched.
+                if literalDefault { fuzzyTokens.append(body) }
+            } else { fuzzyTokens.append(body) }
+        }
+
+        let extTokenBytes: [[UInt8]] = extStrings.map { Array($0.utf8) }
+        // Pre-resolve extension IDs for O(1) matching (UInt16 compare vs byte-by-byte suffix)
+        let extTokenIDs: [UInt16] = extStrings.compactMap { extToID[$0] }
+        // Extensions never seen during indexing have no extID; match them by trailing bytes. These
+        // match disjunctively with extTokenIDs — a file matches if ANY queried extension fits.
+        let extUnknownBytes: [[UInt8]] = extStrings.filter { extToID[$0] == nil }.map { Array($0.utf8) }
+        let hasExtFilter = !extTokenBytes.isEmpty
+        let dirSegments: [[UInt8]] = dirSegStrings.map { Array($0.utf8) }
+        let negExtIDs: [UInt16] = negExtStrings.compactMap { extToID[$0] }
+        let negExtUnknownBytes: [[UInt8]] = negExtStrings.filter { extToID[$0] == nil }.map { Array($0.utf8) }
+        // Prefer directories when the query carries a positive dir-segment (e.g. "config/").
+        let wantDir = !dirSegments.isEmpty
+        // Effective depth limit: smallest of query depth tokens and the explicit parameter
+        let effectiveMaxDepth: Int? = {
+            var v = maxDepth
+            for d in queryDepths {
+                v = v.map { min($0, d) } ?? d
+            }
+            return v
+        }()
+        let q = fuzzyTokens.joined()
+        let hasPositiveOperator = !litSubstrings.isEmpty || !anchorStarts.isEmpty || !anchorEnds.isEmpty
+        let hasNegativeOperator = !negSubstrings.isEmpty || !negExtStrings.isEmpty
+            || !negAnchorStarts.isEmpty || !negAnchorEnds.isEmpty || filesOnly
+        let hasOperators = hasPositiveOperator || hasNegativeOperator
+        // Dirs-only only when the query is SOLELY dir segments: a fuzzy/ext token, or a positive
+        // operator ('foo, ^foo, foo$), means the user also wants the matching files inside.
+        let dirsOnly = dirsOnly
+            || (!dirSegments.isEmpty && fuzzyTokens.isEmpty && extTokenBytes.isEmpty && !hasPositiveOperator)
+        let hasFuzzyQuery = !q.isEmpty || !extTokenBytes.isEmpty || !dirSegments.isEmpty || hasPositiveOperator
+
+        // APFS stores paths in NFD (decomposed Unicode), so normalize query to NFD for primary matching.
+        // Prepare NFC bytes as a fallback for paths stored in NFC (programmatically added, or from a
+        // non-APFS volume). Compare the UTF-8 BYTES — String == uses Unicode canonical equivalence, so
+        // a composed vs decomposed String compares equal and would silently null the fallback.
+        let qBytes = Array(q.decomposedStringWithCanonicalMapping.utf8)
+        let qNFCBytes = Array(q.precomposedStringWithCanonicalMapping.utf8)
+        let qAltBytes: [UInt8]? = qNFCBytes != qBytes ? qNFCBytes : nil
+        // qMask gates the candidate prefilter. When NFD and NFC differ, use the letter intersection
+        // so an NFC-stored accented path isn't pruned before the NFC fallback in scoring can run.
+        let qMask: UInt64 = {
+            guard !qBytes.isEmpty else { return 0 }
+            let m1 = qBytes.withUnsafeBufferPointer { letterMaskBytes($0) }
+            guard let alt = qAltBytes else { return m1 }
+            return m1 & alt.withUnsafeBufferPointer { letterMaskBytes($0) }
+        }()
+        // Per-token byte arrays for independent multi-token scoring. NFD-normalized to match APFS
+        // storage (like qBytes), with a per-token NFC alternate (like qAltBytes) so an IME-typed
+        // CJK/accented token still matches a path stored in the other normalization form. Without
+        // this, a query like "게임플라자 공지 2026" (typed NFC) never matches the NFD-stored path in
+        // the multi-token pass, silently dropping the gap-free per-token score and its boundary
+        // bonuses, so the file sinks below less relevant results.
+        let tokenBytes: [[UInt8]]?
+        let tokenAltBytes: [[UInt8]?]
+        if fuzzyTokens.count > 1 {
+            var prim: [[UInt8]] = []
+            var alt: [[UInt8]?] = []
+            prim.reserveCapacity(fuzzyTokens.count)
+            alt.reserveCapacity(fuzzyTokens.count)
+            for tok in fuzzyTokens {
+                let nfd = Array(tok.decomposedStringWithCanonicalMapping.utf8)
+                let nfc = Array(tok.precomposedStringWithCanonicalMapping.utf8)
+                prim.append(nfd)
+                alt.append(nfc != nfd ? nfc : nil)
+            }
+            tokenBytes = prim
+            tokenAltBytes = alt
+        } else {
+            tokenBytes = nil
+            tokenAltBytes = []
+        }
+        // Bitmask filter uses only ASCII letters/digits, which are identical across NFC/NFD, so no alt mask needed
+        // Include extension token letters in the mask for candidate filtering
+        // Only a SINGLE extension folds its letters into the conjunctive candidate-prefilter mask.
+        // Multiple extensions match disjunctively (OR) — see extensionMatches — so AND-ing their
+        // combined letters into combinedMask would demand every extension's letters appear in one
+        // path at once (e.g. j from .json AND x from .xml AND z from .zsh), which matches nothing.
+        // With >1 extension the precise extID/suffix test in extensionMatches does the filtering.
+        var extMask: UInt64 = 0
+        if extTokenBytes.count == 1 {
+            extTokenBytes[0].withUnsafeBufferPointer { extMask |= letterMaskBytes($0) }
+        }
+        var dirMask: UInt64 = 0
+        for seg in dirSegments {
+            seg.withUnsafeBufferPointer { dirMask |= letterMaskBytes($0) }
+        }
+        // Positive literal/anchor letters are required-present, so fold them into the candidate
+        // prefilter mask. needleMask() uses the NFC∩NFD intersection so an accented needle never
+        // prunes a path that differs only by normalization. ('/' contributes no bits.)
+        var opMask: UInt64 = 0
+        for lit in litSubstrings {
+            opMask |= needleMask(lit)
+        }
+        for a in anchorStarts {
+            opMask |= needleMask(a)
+        }
+        for a in anchorEnds {
+            opMask |= needleMask(a)
+        }
+        let combinedMask = qMask | extMask | dirMask | opMask
+        // Per-needle letter masks gate the negation substring scan: a path can only contain
+        // the needle if its whole-path mask has every needle letter, so the scan is skipped
+        // for the overwhelming majority of entries.
+        let negSubMasks: [UInt64] = negSubstrings.map { needleMask($0) }
+        let negAnchorStartMasks: [UInt64] = negAnchorStarts.map { needleMask($0) }
+
+        let baseBytes: [UInt8]
+        let baseAltBytes: [UInt8]?
+        let hasSlash: Bool
+        if !qBytes.isEmpty {
+            hasSlash = qBytes.contains(0x2F)
+            if let lastSlash = qBytes.lastIndex(of: 0x2F) {
+                baseBytes = Array(qBytes[(lastSlash + 1)...])
+            } else {
+                baseBytes = qBytes
+            }
+            if let alt = qAltBytes {
+                if let lastSlash = alt.lastIndex(of: 0x2F) {
+                    baseAltBytes = Array(alt[(lastSlash + 1)...])
+                } else {
+                    baseAltBytes = alt
+                }
+            } else {
+                baseAltBytes = nil
+            }
+        } else {
+            hasSlash = false
+            baseBytes = []
+            baseAltBytes = nil
+        }
+        // Intersection with the NFC basename letters (when they differ) for the same reason as qMask.
+        let baseMask: UInt64 = {
+            guard !baseBytes.isEmpty else { return 0 }
+            let m1 = baseBytes.withUnsafeBufferPointer { letterMaskBytes($0) }
+            guard let alt = baseAltBytes else { return m1 }
+            return m1 & alt.withUnsafeBufferPointer { letterMaskBytes($0) }
+        }()
+        let suffixBytes: [UInt8]? = suffixPattern.map { Array($0.lowercased().utf8) }
+        let queryHasDot = qBytes.contains(0x2E) || !extTokenBytes.isEmpty
+
+        // Path importance prefixes for scoring (lowercased to match allBytes)
+        let homePrefix = NSHomeDirectory().lowercased()
+        let homePrefixBytes = Array(homePrefix.utf8)
+        let importantPrefixes = [
+            homePrefix + "/documents", homePrefix + "/desktop", homePrefix + "/downloads",
+            homePrefix + "/projects", homePrefix + "/temp",
+            homePrefix + "/music", homePrefix + "/movies", homePrefix + "/pictures",
+            homePrefix + "/library/mobile documents", // iCloud Drive
+            "/applications",
+        ].map { Array($0.utf8) }
+        let libraryPrefix = Array((homePrefix + "/library").utf8)
+
+        /// Path importance (higher = more relevant to the user), shared by the fuzzy scoring loop
+        /// and the extension-only fast path:
+        ///   4 = important user dir (Documents, Desktop, Downloads, Projects, Music, Movies, Pictures, iCloud, /Applications)
+        ///   3 = other home visible
+        ///   2 = home Library visible
+        ///   1 = system/root visible
+        ///   0 = hidden (dotfile/dotdir anywhere in the path)
+        @inline(__always)
+        func computePathImportance(_ allBase: UnsafePointer<UInt8>, _ off: Int, _ len: Int, _ bnOff: Int) -> Int32 {
+            let isHidden: Bool = !queryHasDot && {
+                if bnOff < len, allBase[off + bnOff] == 0x2E { return true }
+                var p = 0
+                while p < len {
+                    if allBase[off + p] == 0x2F, p + 1 < len, allBase[off + p + 1] == 0x2E { return true }
+                    p &+= 1
+                }
+                return false
+            }()
+            if isHidden { return 0 }
+            // Important dirs first.
+            var ipi = 0
+            while ipi < importantPrefixes.count {
+                let pfx = importantPrefixes[ipi]
+                if len >= pfx.count {
+                    var ok = true
+                    var j = 0
+                    while j < pfx.count {
+                        if allBase[off + j] != pfx[j] { ok = false; break }
+                        j &+= 1
+                    }
+                    if ok { return 4 }
+                }
+                ipi &+= 1
+            }
+            // Home path: distinguish Library (lower priority) from other home.
+            if len >= homePrefixBytes.count, {
+                var hp = 0
+                while hp < homePrefixBytes.count {
+                    if allBase[off + hp] != homePrefixBytes[hp] { return false }
+                    hp &+= 1
+                }
+                return true
+            }() {
+                var isLib = len >= libraryPrefix.count
+                if isLib {
+                    var j = 0
+                    while j < libraryPrefix.count {
+                        if allBase[off + j] != libraryPrefix[j] { isLib = false; break }
+                        j &+= 1
+                    }
+                }
+                return isLib ? 2 : 3
+            }
+            return 1
+        }
+
+        // Merge in: query tokens with folderPrefixes parameter
+        let allFolderPrefixes: [String]? = {
+            let combined = (folderPrefixes ?? []) + inPrefixes
+            return combined.isEmpty ? nil : combined
+        }()
+        // Pre-convert prefixes to lowercased byte arrays (allBytes stores lowercased paths)
+        let folderPrefixBytes: [[UInt8]]? = allFolderPrefixes?.map { Array($0.lowercased().utf8) }
+        // Match the indexer's segCount convention: 1 + number of slashes (with trailing slashes trimmed),
+        // except root "/" which is 1.
+        let folderPrefixSegCounts: [Int]? = allFolderPrefixes?.map { p -> Int in
+            if p == "/" { return 1 }
+            var s = p
+            while s.count > 1, s.hasSuffix("/") {
+                s.removeLast()
+            }
+            var n = 1
+            for c in s where c == "/" {
+                n &+= 1
+            }
+            return n
+        }
+        let excludedPrefixBytes: [[UInt8]]? = excludedPrefixes?.map { Array($0.lowercased().utf8) }
+
+        @inline(__always) func depthOK(_ i: Int) -> Bool {
+            guard let maxD = effectiveMaxDepth else { return true }
+            // Default base = 1 (root "/"), so entries directly at root have depth 0
+            var base = 1
+            if let prefixes = folderPrefixBytes, let segs = folderPrefixSegCounts {
+                let off = byteOffsets[i]
+                let len = byteLengths[i]
+                var pi = 0
+                while pi < prefixes.count {
+                    let prefix = prefixes[pi]
+                    if len >= prefix.count {
+                        var ok = true
+                        var j = 0
+                        while j < prefix.count {
+                            if allBytes[off + j] != prefix[j] { ok = false; break }
+                            j &+= 1
+                        }
+                        if ok, segs[pi] > base { base = segs[pi] }
+                    }
+                    pi &+= 1
+                }
+            }
+            let d = entries[i].segCount - base - 1
+            return d <= maxD
+        }
+
+        // Phase 1: candidate filter
+        let t1 = CFAbsoluteTimeGetCurrent()
+        var cands = [Int]()
+        cands.reserveCapacity(min(n, 50000))
+
+        // Pre-compute excluded IDs for O(1) integer lookup instead of O(path_len) string hashing
+        let excludedIDs: Set<Int>?
+        if let excl = excludedPaths, !excl.isEmpty {
+            ensurePathIndex()
+            excludedIDs = Set(excl.compactMap { pathToID[$0] })
+        } else {
+            excludedIDs = nil
+        }
+
+        let isCancelled = cancelled ?? { false }
+
+        /// Dir-segment match (shared by every candidate-filter path). A token "X/" matches a
+        /// descendant via the literal substring "X/", AND — the folder-self-match fix — the
+        /// directory X itself, whose stored path has no trailing slash (so its last segment
+        /// equals X). Without the self-match, "releasenotes/" found files inside ReleaseNotes
+        /// but never the folder itself.
+        @inline(__always) func dirSegMatches(_ i: Int) -> Bool {
+            guard !dirSegments.isEmpty else { return true }
+            let off = byteOffsets[i]
+            let len = byteLengths[i]
+            let isDir = entries[i].isDir
+            var si = 0
+            while si < dirSegments.count {
+                let seg = dirSegments[si]
+                let segLen = seg.count
+                guard len >= segLen else { return false }
+                var found = false
+                // Descendant: literal substring "X/" anywhere in the path.
+                var p = 0
+                let limit = len - segLen
+                while p <= limit {
+                    var ok = true
+                    var j = 0
+                    while j < segLen {
+                        if allBytes[off + p + j] != seg[j] { ok = false; break }
+                        j &+= 1
+                    }
+                    if ok { found = true; break }
+                    p &+= 1
+                }
+                // Folder-self: a directory whose own last segment equals "X" (drop the trailing '/').
+                if !found, isDir {
+                    let core = segLen - 1
+                    if len >= core {
+                        var ok = true
+                        var j = 0
+                        while j < core {
+                            if allBytes[off + len - core + j] != seg[j] { ok = false; break }
+                            j &+= 1
+                        }
+                        if ok {
+                            let start = off + len - core
+                            if start == off || allBytes[start - 1] == 0x2F { found = true }
+                        }
+                    }
+                }
+                if !found { return false }
+                si &+= 1
+            }
+            return true
+        }
+
+        /// Disjunctive extension test shared by every candidate-filter path: a file matches if its
+        /// extID equals ANY queried extension (O(1)), or — for an extension never seen during
+        /// indexing (no extID) — its trailing bytes equal ANY such token. The OR is the whole point:
+        /// ".json .yaml .xml" should return files that are json OR yaml OR xml, not all three at once.
+        @inline(__always) func extensionMatches(_ eid: UInt16, _ off: Int, _ len: Int) -> Bool {
+            var ei = 0
+            while ei < extTokenIDs.count {
+                if eid == extTokenIDs[ei] { return true }
+                ei &+= 1
+            }
+            var ui = 0
+            while ui < extUnknownBytes.count {
+                let ext = extUnknownBytes[ui]
+                if len >= ext.count {
+                    var m = true
+                    var j = 0
+                    while j < ext.count {
+                        if allBytes[off + len - ext.count + j] != ext[j] { m = false; break }
+                        j &+= 1
+                    }
+                    if m { return true }
+                }
+                ui &+= 1
+            }
+            return false
+        }
+
+        /// Common filter: mask, extension ID, excluded IDs/prefixes
+        @inline(__always) func applyBaseFilters(_ i: Int) -> Bool {
+            if hasFuzzyQuery, masks[i] & combinedMask != combinedMask { return false }
+            if !hasFuzzyQuery, masks[i] == 0 { return false }
+
+            if let excl = excludedIDs, excl.contains(i) { return false }
+
+            let off = byteOffsets[i]
+            let len = byteLengths[i]
+
+            // Extension filter (disjunctive): reject unless the entry matches ANY queried extension.
+            if hasExtFilter, !extensionMatches(extIDs[i], off, len) { return false }
+
+            if let prefixes = excludedPrefixBytes {
+                var pi = 0
+                while pi < prefixes.count {
+                    let prefix = prefixes[pi]
+                    if len >= prefix.count {
+                        var ok = true
+                        var j = 0
+                        while j < prefix.count {
+                            if allBytes[off + j] != prefix[j] { ok = false; break }
+                            j &+= 1
+                        }
+                        if ok { return false }
+                    }
+                    pi &+= 1
+                }
+            }
+
+            // Dir segment match (descendant substring + folder-self), shared helper.
+            if !dirSegMatches(i) { return false }
+
+            return true
+        }
+
+        /// Full filter: base + dirsOnly + suffix (skipped when candidatePool already pre-filtered these)
+        @inline(__always) func applyAllFilters(_ i: Int) -> Bool {
+            guard applyBaseFilters(i) else { return false }
+
+            if dirsOnly, !entries[i].isDir { return false }
+
+            if let sfx = suffixBytes {
+                let off = byteOffsets[i]
+                let len = byteLengths[i]
+                if len < sfx.count { return false }
+                var match = true
+                var j = 0
+                while j < sfx.count {
+                    if allBytes[off + len - sfx.count + j] != sfx[j] { match = false; break }
+                    j &+= 1
+                }
+                if !match { return false }
+            }
+
+            return true
+        }
+
+        // Byte-level folder prefix check (shared by candidatePool and full scan paths)
+        // A path is "inside" a folder prefix only if it is a STRICT descendant: it starts with the
+        // prefix AND has a path separator right after it. This excludes the folder itself (so
+        // `in:~/Foo` returns only the contents, not Foo) and excludes prefix-siblings (so `in:~/Foo`
+        // doesn't match ~/Foobar). The folder prefixes are stored without a trailing slash (root "/"
+        // being the sole exception, which already ends in '/').
+        @inline(__always) func strictlyInside(_ off: Int, _ len: Int, _ prefix: [UInt8]) -> Bool {
+            let pc = prefix.count
+            guard pc > 0, len > pc else { return false }
+            var j = 0
+            while j < pc {
+                if allBytes[off + j] != prefix[j] { return false }
+                j &+= 1
+            }
+            if prefix[pc - 1] == 0x2F { return true }
+            return allBytes[off + pc] == 0x2F
+        }
+
+        @inline(__always) func matchesFolderPrefix(_ i: Int) -> Bool {
+            guard let prefixes = folderPrefixBytes else { return true }
+            let off = byteOffsets[i]
+            let len = byteLengths[i]
+            var pi = 0
+            while pi < prefixes.count {
+                if strictlyInside(off, len, prefixes[pi]) { return true }
+                pi &+= 1
+            }
+            return false
+        }
+
+        /// Operator pass: positive literal/anchor terms (required) + negation/files-only
+        /// (reject). Run once over the assembled candidate list so every filter path
+        /// (full-scan, sorted-prefix, QuickFilter pool) honors it uniformly. `allBase` is the
+        /// start of the shared lowercased byte buffer; valid for the lock's duration.
+        /// Match an operator needle in either normalization form (NFD primary, NFC fallback).
+        @inline(__always) func containsOp(_ pathPtr: UnsafePointer<UInt8>, _ len: Int, _ n: OpNeedle) -> Bool {
+            if n.nfd.withUnsafeBufferPointer({ simdContains(pathPtr, count: len, needle: $0.baseAddress!, needleLen: $0.count) }) { return true }
+            guard let alt = n.nfc else { return false }
+            return alt.withUnsafeBufferPointer { simdContains(pathPtr, count: len, needle: $0.baseAddress!, needleLen: $0.count) }
+        }
+        @inline(__always) func nameEndsOp(_ allBase: UnsafePointer<UInt8>, _ off: Int, _ len: Int, _ bnStart: Int, _ n: OpNeedle) -> Bool {
+            if n.nfd.withUnsafeBufferPointer({ nameEndsWith(allBase, off: off, len: len, bnStart: bnStart, needle: $0.baseAddress!, needleLen: $0.count) }) { return true }
+            guard let alt = n.nfc else { return false }
+            return alt.withUnsafeBufferPointer { nameEndsWith(allBase, off: off, len: len, bnStart: bnStart, needle: $0.baseAddress!, needleLen: $0.count) }
+        }
+
+        @inline(__always) func passesOperators(_ i: Int, _ allBase: UnsafePointer<UInt8>) -> Bool {
+            let off = byteOffsets[i]
+            let len = byteLengths[i]
+            let e = entries[i]
+            if filesOnly, e.isDir { return false }
+            let pathPtr = allBase + off
+
+            var k = 0
+            while k < litSubstrings.count {
+                if !containsOp(pathPtr, len, litSubstrings[k]) { return false }
+                k &+= 1
+            }
+            k = 0
+            while k < anchorStarts.count {
+                if !containsOp(pathPtr, len, anchorStarts[k]) { return false }
+                k &+= 1
+            }
+            k = 0
+            while k < anchorEnds.count {
+                if !nameEndsOp(allBase, off, len, e.bnStart, anchorEnds[k]) { return false }
+                k &+= 1
+            }
+
+            if !negExtIDs.isEmpty {
+                let eid = extIDs[i]
+                var ni = 0
+                while ni < negExtIDs.count {
+                    if eid == negExtIDs[ni] { return false }; ni &+= 1
+                }
+            }
+            if !negExtUnknownBytes.isEmpty {
+                var ni = 0
+                while ni < negExtUnknownBytes.count {
+                    let ext = negExtUnknownBytes[ni]
+                    if len >= ext.count {
+                        var match = true
+                        var j = 0
+                        while j < ext.count {
+                            if allBase[off + len - ext.count + j] != ext[j] { match = false; break }; j &+= 1
+                        }
+                        if match { return false }
+                    }
+                    ni &+= 1
+                }
+            }
+            k = 0
+            while k < negSubstrings.count {
+                if masks[i] & negSubMasks[k] == negSubMasks[k], containsOp(pathPtr, len, negSubstrings[k]) { return false }
+                k &+= 1
+            }
+            k = 0
+            while k < negAnchorStarts.count {
+                if masks[i] & negAnchorStartMasks[k] == negAnchorStartMasks[k], containsOp(pathPtr, len, negAnchorStarts[k]) { return false }
+                k &+= 1
+            }
+            k = 0
+            while k < negAnchorEnds.count {
+                if nameEndsOp(allBase, off, len, e.bnStart, negAnchorEnds[k]) { return false }
+                k &+= 1
+            }
+            return true
+        }
+
+        if let pool = candidatePool {
+            // Pre-filtered candidate pool (from QuickFilter prefilter)
+            // suffix/dirsOnly already applied, also apply folder prefix + mask + excluded
+            //
+            // The pool is a snapshot of entry indices captured by prefilter() against the engine
+            // as it was then. A reindex/reload since then (clear() or loadBinaryIndex()) can have
+            // replaced the parallel arrays with a shorter set, leaving stale indices that now point
+            // past the end. All parallel arrays are length n under the lock, so n is the authoritative
+            // bound: skip anything out of range rather than trapping on masks[i]/byteOffsets[i]/etc.
+            var pi = 0
+            while pi < pool.count {
+                let i = pool[pi]
+                if i >= 0, i < n, applyBaseFilters(i), matchesFolderPrefix(i), depthOK(i) { cands.append(i) }
+                pi &+= 1
+            }
+        } else if let prefixBytes = folderPrefixBytes, let sorted = sortedByPath {
+            // Fast path: O(log n + k) prefix lookup via sorted index (built lazily)
+            var pxi = 0
+            while pxi < prefixBytes.count {
+                let prefix = prefixBytes[pxi]
+                let lo = sortedLowerBound(prefix, sorted: sorted)
+                let hi = sortedUpperBound(prefix, sorted: sorted, from: lo)
+                var idx = lo
+                while idx < hi {
+                    let i = sorted[idx]
+                    // The [lo, hi) range matches the prefix loosely (includes the folder itself and
+                    // prefix-siblings); strictlyInside keeps only true descendants.
+                    if strictlyInside(byteOffsets[i], byteLengths[i], prefix), applyAllFilters(i), depthOK(i) { cands.append(i) }
+                    idx &+= 1
+                }
+                pxi &+= 1
+            }
+        } else {
+            // Parallel full scan across CPU cores
+            let filterProcs = max(ProcessInfo.processInfo.activeProcessorCount, 1)
+            let filterChunkSize = (n + filterProcs - 1) / filterProcs
+            let filterChunks = (n + filterChunkSize - 1) / filterChunkSize
+            let candStore = UnsafeMutablePointer<[Int]>.allocate(capacity: max(filterChunks, 1))
+            candStore.initialize(repeating: [], count: max(filterChunks, 1))
+            defer { candStore.deinitialize(count: max(filterChunks, 1)); candStore.deallocate() }
+
+            masks.withUnsafeBufferPointer { maskBuf in
+                let maskPtr = maskBuf.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: filterChunks) { chunk in
+                    let lo = chunk * filterChunkSize
+                    let hi = min(lo + filterChunkSize, n)
+                    var local = [Int]()
+                    local.reserveCapacity((hi - lo) / 10)
+
+                    var i = lo
+                    while i < hi {
+                        if hasFuzzyQuery {
+                            if maskPtr[i] & combinedMask != combinedMask { i &+= 1; continue }
+                        } else {
+                            if maskPtr[i] == 0 { i &+= 1; continue }
+                        }
+                        if let excl = excludedIDs, excl.contains(i) { i &+= 1; continue }
+
+                        let off = byteOffsets[i]
+                        let len = byteLengths[i]
+
+                        // Extension filter (disjunctive): keep only entries matching ANY queried extension.
+                        if hasExtFilter, !extensionMatches(self.extIDs[i], off, len) { i &+= 1; continue }
+
+                        if let prefixes = folderPrefixBytes {
+                            var matched = false
+                            var pi = 0
+                            while pi < prefixes.count {
+                                if strictlyInside(off, len, prefixes[pi]) { matched = true; break }
+                                pi &+= 1
+                            }
+                            if !matched { i &+= 1; continue }
+                        }
+
+                        if let prefixes = excludedPrefixBytes {
+                            var excluded = false
+                            var pi = 0
+                            while pi < prefixes.count {
+                                let prefix = prefixes[pi]
+                                if len >= prefix.count {
+                                    var ok = true
+                                    var j = 0
+                                    while j < prefix.count {
+                                        if allBytes[off + j] != prefix[j] { ok = false; break }
+                                        j &+= 1
+                                    }
+                                    if ok { excluded = true; break }
+                                }
+                                pi &+= 1
+                            }
+                            if excluded { i &+= 1; continue }
+                        }
+
+                        if dirsOnly, !entries[i].isDir { i &+= 1; continue }
+
+                        if let sfx = suffixBytes {
+                            if len < sfx.count { i &+= 1; continue }
+                            var match = true
+                            var j = 0
+                            while j < sfx.count {
+                                if allBytes[off + len - sfx.count + j] != sfx[j] { match = false; break }
+                                j &+= 1
+                            }
+                            if !match { i &+= 1; continue }
+                        }
+
+                        // Dir segment match (descendant substring + folder-self), shared helper.
+                        if !dirSegMatches(i) { i &+= 1; continue }
+
+                        if !depthOK(i) { i &+= 1; continue }
+
+                        local.append(i)
+                        i &+= 1
+                    }
+                    candStore[chunk] = local
+                }
+            }
+
+            // Merge chunk results
+            var ci = 0
+            while ci < filterChunks {
+                cands.append(contentsOf: candStore[ci])
+                ci &+= 1
+            }
+        }
+        // Apply fzf-style operators (negation, literal, anchors, files-only) in one SIMD pass
+        // over the assembled candidate list. Positive operator letters are already in
+        // combinedMask, so most non-matches were pruned upstream; this confirms substrings and
+        // rejects negated matches before scoring and before the extension-only fast path.
+        if hasOperators, !cands.isEmpty {
+            allBytes.withUnsafeBufferPointer { buf in
+                let allBase = buf.baseAddress!
+                cands = cands.filter { passesOperators($0, allBase) }
+            }
+        }
+        // Trigger lazy build of sorted path index for next folder-filtered search
+        if folderPrefixBytes != nil, sortedByPath == nil {
+            DispatchQueue.global(qos: .utility).async { [self] in buildSortedPathIndex() }
+        }
+        let filterMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000
+        if cands.count > 200_000 {
+            // A candidate whose BASENAME carries every query letter is where exact, prefix and
+            // basename matches come from, so it is exempt from the length cull. Without the
+            // exemption a perfect hit is dropped for being deep: ".../idlelib/searchengine.py"
+            // (123 bytes) for query "searchengine" sits far past the ~77 byte cutoff a 1.5M entry
+            // scope produces, while weak subsequence matches survive purely by having shorter
+            // paths. Needs a real fuzzy body, since baseMask == 0 (extension-only query) would
+            // exempt every candidate and defeat the cap.
+            //
+            // The counting sort and the exempt tally share one pass: each candidate costs a random
+            // read of byteLengths/bnMasks, so walking the list twice to count them separately
+            // doubled the cost of a broad query.
+            let maxPathLen = 4096
+            let lenCounts = UnsafeMutablePointer<Int>.allocate(capacity: maxPathLen * 2)
+            lenCounts.initialize(repeating: 0, count: maxPathLen * 2)
+            let exemptLenCounts = lenCounts + maxPathLen
+            let splitExempt = baseMask != 0
+            var exemptCount = 0
+            var ci = 0
+            while ci < cands.count {
+                let id = cands[ci]
+                let l = min(byteLengths[id], maxPathLen - 1)
+                if splitExempt, bnMasks[id] & baseMask == baseMask {
+                    exemptCount &+= 1; exemptLenCounts[l] &+= 1
+                } else {
+                    lenCounts[l] &+= 1
+                }
+                ci &+= 1
+            }
+            // A one or two character query matches nearly every basename. If the exempt set alone
+            // blows the budget, fold it back in and length-cull everything as before.
+            let exemptActive = exemptCount > 0 && exemptCount < 200_000
+            if !exemptActive, exemptCount > 0 {
+                var mi = 0
+                while mi < maxPathLen {
+                    lenCounts[mi] &+= exemptLenCounts[mi]; mi &+= 1
+                }
+                exemptCount = 0
+            }
+            // Exempt entries are long by construction (that is why the cull was dropping them) and
+            // scoring cost scales with path length, so an unbounded exemption makes a common-letter
+            // query like "readme" (116k exempt) roughly twice as slow. Cap it: the shortest
+            // exemptCap of them are kept, which covers the handful of deep exact matches a specific
+            // query produces while bounding the extra work a vague one can buy.
+            let exemptCap = 50000
+            var exemptCutoff = maxPathLen - 1
+            if exemptActive, exemptCount > exemptCap {
+                var ecumul = 0
+                var eli = 0
+                while eli < maxPathLen {
+                    ecumul &+= exemptLenCounts[eli]
+                    if ecumul >= exemptCap { exemptCutoff = eli; break }
+                    eli &+= 1
+                }
+                exemptCount = ecumul
+            }
+            let budget = 200_000 - exemptCount
+
+            var cumul = 0, cutoff = maxPathLen - 1
+            var li = 0
+            while li < maxPathLen {
+                cumul &+= lenCounts[li]
+                if cumul >= budget { cutoff = li; break }
+                li &+= 1
+            }
+            lenCounts.deallocate()
+            // Keep ALL entries at or below cutoff length (don't bias by entry order), plus every
+            // exempt entry regardless of how long its path is.
+            var filtered = [Int]()
+            filtered.reserveCapacity(cumul + exemptCount)
+            ci = 0
+            while ci < cands.count {
+                let id = cands[ci]
+                if byteLengths[id] <= cutoff
+                    || (exemptActive && byteLengths[id] <= exemptCutoff && bnMasks[id] & baseMask == baseMask)
+                {
+                    filtered.append(id)
+                }
+                ci &+= 1
+            }
+            cands = filtered
+        }
+
+        if qBytes.isEmpty, dirSegments.isEmpty {
+            // Extension-only filter: keep only entries matching the extension
+            if !extTokenBytes.isEmpty {
+                var extFiltered = [Int]()
+                extFiltered.reserveCapacity(cands.count / 10)
+                var ci = 0
+                while ci < cands.count {
+                    let id = cands[ci]
+                    if extensionMatches(extIDs[id], byteOffsets[id], byteLengths[id]) { extFiltered.append(id) }
+                    ci &+= 1
+                }
+                cands = extFiltered
+            }
+
+            // Rank: important locations first (so user media beats shallow system/app noise),
+            // then shallower paths, then shorter paths. Importance is precomputed once per
+            // candidate and also written into each SearchResult, so the cross-engine merge's
+            // re-sort by rank preserves this ordering instead of collapsing everything to rank 0.
+            var imp = [Int32](repeating: 1, count: cands.count)
+            allBytes.withUnsafeBufferPointer { buf in
+                let allBase = buf.baseAddress!
+                var ci = 0
+                while ci < cands.count {
+                    let id = cands[ci]
+                    imp[ci] = computePathImportance(allBase, byteOffsets[id], byteLengths[id], entries[id].bnStart)
+                    ci &+= 1
+                }
+            }
+            // Sort an index permutation so `imp` stays aligned with its candidate.
+            var order = Array(0 ..< cands.count)
+            order.sort { x, y in
+                if imp[x] != imp[y] { return imp[x] > imp[y] }
+                let aSeg = entries[cands[x]].segCount, bSeg = entries[cands[y]].segCount
+                if aSeg != bSeg { return aSeg < bSeg }
+                return byteLengths[cands[x]] < byteLengths[cands[y]]
+            }
+            let results = order.prefix(maxResults).map { oi -> SearchResult in
+                let id = cands[oi]
+                let e = entries[id]
+                return SearchResult(path: e.path, isDir: e.isDir, score: 0, quality: 0, hasBase: false, segmentMatches: 0, pathImportance: Int(imp[oi]), prefixMatch: false, depth: e.segCount)
+            }
+            let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            slog.debug("search: q=\"\(query)\" \(n) entries, \(cands.count) cands, \(results.count) results in \(totalMs, format: .fixed(precision: 1))ms (filter=\(filterMs, format: .fixed(precision: 1))ms)")
+            return results
+        }
+
+        // Phase 2: fuzzy scoring
+        let t2 = CFAbsoluteTimeGetCurrent()
+        if isCancelled() { return [] }
+
+        let nCands = cands.count
+        let nProcs = max(ProcessInfo.processInfo.activeProcessorCount, 1)
+        let chunkSize = max(nCands / nProcs, 512)
+        let nChunks = nCands == 0 ? 0 : (nCands + chunkSize - 1) / chunkSize
+        let chunkStore = UnsafeMutablePointer<[ScoredEntry]>.allocate(capacity: max(nChunks, 1))
+        chunkStore.initialize(repeating: [], count: max(nChunks, 1))
+        defer { chunkStore.deinitialize(count: max(nChunks, 1)); chunkStore.deallocate() }
+
+        allBytes.withUnsafeBufferPointer { allBuf in
+            let allBase = allBuf.baseAddress!
+
+            qBytes.withUnsafeBufferPointer { qBuf in
+                baseBytes.withUnsafeBufferPointer { baseBuf in
+                    DispatchQueue.concurrentPerform(iterations: nChunks) { chunk in
+                        let lo = chunk * chunkSize
+                        let hi = min(lo + chunkSize, nCands)
+                        var local = [ScoredEntry]()
+                        local.reserveCapacity(hi - lo)
+                        var idx = lo
+                        while idx < hi {
+                            if idx & 0x1FF == 0, isCancelled() { break }
+                            let id = cands[idx]
+                            let e = self.entries[id]
+                            let off = self.byteOffsets[id]
+                            let len = self.byteLengths[id]
+                            let bnOff = e.bnStart
+
+                            var baseScore = Int.min, baseWindow = 0
+                            var pathScore = Int.min, pathWindow = 0
+                            var segMatches = 0
+                            let hasBase: Bool
+                            let hasPath: Bool
+
+                            if qBuf.count > 0 {
+                                let bnBuf = UnsafeBufferPointer(start: allBase + off + bnOff, count: len - bnOff)
+                                let bnBounds = self.bnBoundaries[id]
+                                if self.bnMasks[id] & baseMask == baseMask {
+                                    if let r = fuzzyScoreBytes(baseBuf, bnBuf, boundaries: bnBounds) {
+                                        baseScore = r.score; baseWindow = r.end - r.start
+                                    }
+                                }
+
+                                let pathBuf = UnsafeBufferPointer(start: allBase + off, count: len)
+                                if let r = fuzzyScoreBytes(qBuf, pathBuf, boundaries: bnBounds, boundariesOffset: bnOff) {
+                                    pathScore = r.score; pathWindow = r.end - r.start
+                                }
+
+                                // Multi-token independent scoring: score each token separately against
+                                // non-overlapping regions. Each token must match after the previous token's
+                                // match end, so "prv sky" matches "PrivateFrameworks/SkyLight" but each
+                                // token occupies a distinct path segment.
+                                if let tokens = tokenBytes {
+                                    var tokenPathScore = 0, tokenPathStart = Int.max, tokenPathEnd = 0
+                                    var allTokensMatchPath = true
+                                    var pathSearchFrom = 0
+                                    var tokenSegMatches = 0
+                                    for (ti, token) in tokens.enumerated() {
+                                        guard allTokensMatchPath, pathSearchFrom < len else {
+                                            allTokensMatchPath = false; break
+                                        }
+                                        let slice = UnsafeBufferPointer(start: allBase + off + pathSearchFrom, count: len - pathSearchFrom)
+                                        // May go negative once pathSearchFrom passes bnOff: bpos = i - boff
+                                        // must stay basename-relative, and fuzzyScoreBytes guards 0..<64.
+                                        let boff = bnOff - pathSearchFrom
+                                        var r = token.withUnsafeBufferPointer {
+                                            fuzzyScoreBytes($0, slice, boundaries: bnBounds, boundariesOffset: boff)
+                                        }
+                                        // NFC fallback: the stored path may be in the other normalization form.
+                                        // Scale the score up to the NFD byte length so NFC-stored paths rank
+                                        // on the same scale as NFD-stored twins (NFD hangul is ~2x the bytes).
+                                        if r == nil, let alt = tokenAltBytes[ti] {
+                                            r = alt.withUnsafeBufferPointer {
+                                                fuzzyScoreBytes($0, slice, boundaries: bnBounds, boundariesOffset: boff)
+                                            }
+                                            if let rr = r, !alt.isEmpty {
+                                                r = (rr.score * token.count / alt.count, rr.start, rr.end)
+                                            }
+                                        }
+                                        if let r {
+                                            tokenPathScore &+= r.score
+                                            let absStart = pathSearchFrom + r.start
+                                            let absEnd = pathSearchFrom + r.end
+                                            tokenPathStart = min(tokenPathStart, absStart)
+                                            tokenPathEnd = max(tokenPathEnd, absEnd)
+                                            // Check if match starts at a segment boundary (after / or start of path)
+                                            if absStart == 0 || allBase[off + absStart - 1] == 0x2F {
+                                                tokenSegMatches &+= 1
+                                            }
+                                            pathSearchFrom = absEnd
+                                        } else { allTokensMatchPath = false; break }
+                                    }
+                                    if allTokensMatchPath, tokenPathScore > pathScore {
+                                        pathScore = tokenPathScore; pathWindow = tokenPathEnd - tokenPathStart
+                                        segMatches = tokenSegMatches
+                                    }
+
+                                    var tokenBaseScore = 0, tokenBaseStart = Int.max, tokenBaseEnd = 0
+                                    var allTokensMatchBase = true
+                                    var baseSearchFrom = 0
+                                    let bnLen = len - bnOff
+                                    for (ti, token) in tokens.enumerated() {
+                                        guard allTokensMatchBase, baseSearchFrom < bnLen else {
+                                            allTokensMatchBase = false; break
+                                        }
+                                        let slice = UnsafeBufferPointer(start: allBase + off + bnOff + baseSearchFrom, count: bnLen - baseSearchFrom)
+                                        // Slice byte i is basename byte i + baseSearchFrom, so the offset is
+                                        // negative: bpos = i - (-baseSearchFrom) = i + baseSearchFrom.
+                                        var r = token.withUnsafeBufferPointer {
+                                            fuzzyScoreBytes($0, slice, boundaries: bnBounds, boundariesOffset: -baseSearchFrom)
+                                        }
+                                        if r == nil, let alt = tokenAltBytes[ti] {
+                                            r = alt.withUnsafeBufferPointer {
+                                                fuzzyScoreBytes($0, slice, boundaries: bnBounds, boundariesOffset: -baseSearchFrom)
+                                            }
+                                            if let rr = r, !alt.isEmpty {
+                                                r = (rr.score * token.count / alt.count, rr.start, rr.end)
+                                            }
+                                        }
+                                        if let r {
+                                            tokenBaseScore &+= r.score
+                                            tokenBaseStart = min(tokenBaseStart, baseSearchFrom + r.start)
+                                            tokenBaseEnd = max(tokenBaseEnd, baseSearchFrom + r.end)
+                                            baseSearchFrom = baseSearchFrom + r.end
+                                        } else { allTokensMatchBase = false; break }
+                                    }
+                                    if allTokensMatchBase, tokenBaseScore > baseScore {
+                                        baseScore = tokenBaseScore; baseWindow = tokenBaseEnd - tokenBaseStart
+                                    }
+                                }
+
+                                // NFC fallback for Unicode paths that differ in normalization
+                                if baseScore == Int.min, pathScore == Int.min, let altQ = qAltBytes, let altBase = baseAltBytes {
+                                    altQ.withUnsafeBufferPointer { altQBuf in
+                                        altBase.withUnsafeBufferPointer { altBaseBuf in
+                                            // Same NFD-scale normalization as the per-token fallback above.
+                                            if let r = fuzzyScoreBytes(altBaseBuf, bnBuf, boundaries: bnBounds) {
+                                                baseScore = r.score * baseBytes.count / altBase.count; baseWindow = r.end - r.start
+                                            }
+                                            if let r = fuzzyScoreBytes(altQBuf, pathBuf, boundaries: bnBounds, boundariesOffset: bnOff) {
+                                                pathScore = r.score * qBytes.count / altQ.count; pathWindow = r.end - r.start
+                                            }
+                                        }
+                                    }
+                                }
+
+                                hasBase = baseScore > Int.min
+                                hasPath = pathScore > Int.min
+                                guard hasBase || hasPath else { idx &+= 1; continue }
+                            } else if !dirSegments.isEmpty {
+                                // Dir-segment-only query: score based on path brevity
+                                // (dir segment already verified as literal match in candidate filter)
+                                let dirSegLen = dirSegments.reduce(0) { $0 + $1.count }
+                                pathScore = dirSegLen * 16 // scoreMatch per char
+                                pathWindow = len
+                                hasBase = false
+                                hasPath = true
+                            } else {
+                                // Extension-only query: no fuzzy match needed
+                                hasBase = false
+                                hasPath = false
+                            }
+
+                            let sHasBase = Int32(hasSlash ? 0 : (hasBase ? 1 : 0))
+
+                            // Path importance (see computePathImportance, defined above): lifts
+                            // user/media dirs above system noise; hidden paths sink to 0.
+                            let sPathImportance = computePathImportance(allBase, off, len, bnOff)
+
+                            // Prefix/extension match
+                            let sPrefixMatch: Int32
+                            let bnLen = len - e.bnStart
+
+                            // Check extension tokens against entry's extension ID (O(1)) or fallback to byte suffix
+                            var extOK = false
+                            if !extTokenIDs.isEmpty {
+                                let eid = self.extIDs[id]
+                                var ei = 0
+                                while ei < extTokenIDs.count {
+                                    if eid == extTokenIDs[ei] { extOK = true; break }
+                                    ei &+= 1
+                                }
+                            } else if !extTokenBytes.isEmpty {
+                                var ei = 0
+                                while ei < extTokenBytes.count {
+                                    let ext = extTokenBytes[ei]
+                                    if bnLen >= ext.count {
+                                        var match = true
+                                        var p = 0
+                                        while p < ext.count {
+                                            if allBase[off + e.bnStart + bnLen - ext.count + p] != ext[p] { match = false; break }
+                                            p &+= 1
+                                        }
+                                        if match { extOK = true; break }
+                                    }
+                                    ei &+= 1
+                                }
+                            }
+
+                            if let tokens = tokenBytes, hasBase {
+                                // Multi-token: check each token as literal substring at word boundaries in basename
+                                let bnBase = off + e.bnStart
+                                var tokenBoundaryCount = 0
+                                var ti = 0
+                                while ti < tokens.count {
+                                    let token = tokens[ti]
+                                    let tLen = token.count
+                                    guard tLen <= bnLen else { ti &+= 1; continue }
+                                    var found = false
+                                    // Check prefix: basename starts with this token
+                                    var p = 0
+                                    var prefixOK = true
+                                    while p < tLen {
+                                        if allBase[bnBase + p] != token[p] { prefixOK = false; break }
+                                        p &+= 1
+                                    }
+                                    if prefixOK { found = true }
+                                    if !found {
+                                        // Check after each word boundary (space, dash, underscore, dot, slash)
+                                        var bi = 1
+                                        while bi + tLen <= bnLen {
+                                            let prev = allBase[bnBase + bi - 1]
+                                            if prev == 0x20 || prev == 0x2D || prev == 0x5F || prev == 0x2E || prev == 0x2F {
+                                                var ok = true; p = 0
+                                                while p < tLen {
+                                                    if allBase[bnBase + bi + p] != token[p] { ok = false; break }
+                                                    p &+= 1
+                                                }
+                                                if ok { found = true; break }
+                                            }
+                                            bi &+= 1
+                                        }
+                                    }
+                                    if found { tokenBoundaryCount &+= 1 }
+                                    ti &+= 1
+                                }
+                                if tokenBoundaryCount == tokens.count || extOK {
+                                    sPrefixMatch = 2
+                                } else if tokenBoundaryCount > 0 {
+                                    sPrefixMatch = 1
+                                } else {
+                                    sPrefixMatch = 0
+                                }
+                                segMatches = max(segMatches, tokenBoundaryCount)
+                            } else if hasBase, baseBytes.count <= bnLen {
+                                let bnBase = off + e.bnStart
+                                // Check prefix: basename starts with query
+                                var prefixOK = true
+                                var p = 0
+                                while p < baseBytes.count {
+                                    if allBase[bnBase + p] != baseBytes[p] { prefixOK = false; break }
+                                    p &+= 1
+                                }
+                                if prefixOK || extOK {
+                                    sPrefixMatch = 2
+                                } else {
+                                    // Check word-boundary: query matches right after a delimiter (- _ . /) in basename
+                                    var boundaryMatch = false
+                                    var bi = 1
+                                    while bi + baseBytes.count <= bnLen {
+                                        let prev = allBase[bnBase + bi - 1]
+                                        if prev == 0x2D || prev == 0x5F || prev == 0x2E || prev == 0x2F || prev == 0x20 {
+                                            var ok = true; p = 0
+                                            while p < baseBytes.count {
+                                                if allBase[bnBase + bi + p] != baseBytes[p] { ok = false; break }
+                                                p &+= 1
+                                            }
+                                            if ok { boundaryMatch = true; break }
+                                        }
+                                        bi &+= 1
+                                    }
+                                    sPrefixMatch = boundaryMatch ? 1 : 0
+                                }
+                            } else {
+                                sPrefixMatch = extOK ? 2 : 0
+                            }
+
+                            let tight = hasBase ? baseWindow : pathWindow
+                            // Penalize unmatched basename bytes so tight matches in short
+                            // basenames (e.g. "mkfl" → "Makefile") beat sparse matches in
+                            // long camelCase basenames (e.g. "...MaskForLocal...").
+                            let basenameWaste = hasBase ? max(0, bnLen - baseWindow) : 0
+                            let adjBaseScore = baseScore &- basenameWaste &* SC.basenameWastePenalty
+                            let sTight = Int32(-tight)
+                            let sBase = Int32(hasBase ? adjBaseScore : -1000)
+                            let sPath = Int32(hasPath ? pathScore : -1000)
+                            let sDir = Int32(wantDir ? (e.isDir ? 100 : -100) : 0)
+                            let sDepth = Int32(-e.segCount)
+                            let sShorter = Int32(-e.pathLen)
+
+                            // When hasBase, pathScore for a non-slash query usually matches the
+                            // same characters in the basename, so taking max() with raw pathScore
+                            // would discard the waste penalty. Prefer adjBaseScore in that case.
+                            let best = hasBase ? adjBaseScore : (hasPath ? pathScore : 0)
+                            let queryLen = !qBytes.isEmpty ? qBytes.count : dirSegments.reduce(0) { $0 + $1.count }
+                            let qual: Int = if hasBase {
+                                adjBaseScore * baseBytes.count / max(baseWindow, 1)
+                            } else if tokenBytes != nil {
+                                // Multi-token: use score directly since window spans across segments
+                                pathScore
+                            } else {
+                                pathScore * queryLen / max(pathWindow, 1)
+                            }
+
+                            let key = SortKey(
+                                a: sHasBase,
+                                b: sPrefixMatch,
+                                c: sPathImportance,
+                                d: sBase,
+                                e: sTight,
+                                f: sPath,
+                                g: sDir,
+                                h: sDepth,
+                                i: sShorter
+                            )
+                            local.append(ScoredEntry(
+                                id: id,
+                                key: key,
+                                bestScore: best,
+                                quality: qual,
+                                hasBase: hasBase,
+                                segmentMatches: segMatches
+                            ))
+                            idx &+= 1
+                        }
+                        chunkStore[chunk] = local
+                    }
+                }
+            }
+        }
+        let scoreMs = (CFAbsoluteTimeGetCurrent() - t2) * 1000
+        var scored = [ScoredEntry]()
+        var totalScored = 0
+        for i in 0 ..< nChunks {
+            totalScored &+= chunkStore[i].count
+        }
+        scored.reserveCapacity(min(totalScored, maxResults * 4))
+        for i in 0 ..< nChunks {
+            scored.append(contentsOf: chunkStore[i])
+        }
+
+        if isCancelled() { return [] }
+
+        let t3 = CFAbsoluteTimeGetCurrent()
+        scored.sort { $0.key < $1.key }
+        let sortMs = (CFAbsoluteTimeGetCurrent() - t3) * 1000
+
+        if !scored.isEmpty {
+            let topQ = scored[0].quality
+            let minQ = max(topQ * 4 / 10, qBytes.count * scoreMatch / 2)
+            // Basename matches are exempt from the density floor (like FuzzyClient.mergeResults):
+            // an NFC-stored CJK basename match scores on the smaller NFC byte scale and would
+            // otherwise be dropped whenever NFD-stored path matches set a high topQ.
+            let filtered = scored.filter { $0.quality >= minQ || $0.hasBase }
+            // If the strict density-based floor kills every match (typical for
+            // a dense single-token query like "prvskyl" that legitimately spans
+            // multiple path segments — quality = pathScore * qLen / window
+            // collapses with wide windows), fall back to the unfiltered set so
+            // the user sees low-density matches instead of zero results.
+            if !filtered.isEmpty {
+                scored = filtered
+            }
+        }
+
+        // Keep a wider pool (4x maxResults) then sort by rank to ensure high-scoring
+        // path matches aren't eclipsed by lower-scoring basename matches
+        let pool = scored.prefix(maxResults * 4)
+        var results = pool.map { s in
+            let e = entries[s.id]
+            return SearchResult(path: e.path, isDir: e.isDir, score: s.bestScore, quality: s.quality, hasBase: s.hasBase, segmentMatches: s.segmentMatches, pathImportance: Int(s.key.c), prefixMatch: s.key.b > 0, depth: e.segCount)
+        }
+        results.sort { $0 > $1 }
+        results = Array(results.prefix(maxResults))
+
+        let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        slog
+            .debug(
+                "search: q=\"\(query)\" \(n) entries, \(cands.count) cands, \(scored.count) scored, \(results.count) results in \(totalMs, format: .fixed(precision: 1))ms (filter=\(filterMs, format: .fixed(precision: 1))ms score=\(scoreMs, format: .fixed(precision: 1))ms sort=\(sortMs, format: .fixed(precision: 1))ms)"
+            )
+        return results
+    }
+
+    // MARK: - Search
+
+    /// Sort dimensions (all descending: higher = better):
+    ///   a = has_base:       1 if basename matched (non-slash queries), else 0
+    ///   b = prefix_match:   1 if basename starts/ends with query or extension token
+    ///   c = path_importance: 4=important user dir, 3=home, 2=library, 1=system, 0=hidden
+    ///   d = basename:     fuzzy score of query vs basename (checked before tightness so boundary matches win)
+    ///   e = tightness:    -(match window width), tighter = better
+    ///   f = fullpath:     fuzzy score of query vs full path
+    ///   g = dir_bonus:    +100 if dir and query ends with /, -100 if file, 0 if no /
+    ///   h = depth:        -(segment count), shallower = better
+    ///   i = shorter:      -(path byte length), shorter = better
+    private struct SortKey: Comparable {
+        let a, b, c, d, e, f, g, h, i: Int32
+
+        @inline(__always) static func < (l: SortKey, r: SortKey) -> Bool {
+            if l.a != r.a { return l.a > r.a }
+            if l.b != r.b { return l.b > r.b }
+            if l.c != r.c { return l.c > r.c }
+            if l.d != r.d { return l.d > r.d }
+            if l.e != r.e { return l.e > r.e }
+            if l.f != r.f { return l.f > r.f }
+            if l.g != r.g { return l.g > r.g }
+            if l.h != r.h { return l.h > r.h }
+            return l.i > r.i
+        }
+        @inline(__always) static func == (l: SortKey, r: SortKey) -> Bool {
+            l.a == r.a && l.b == r.b && l.c == r.c && l.d == r.d && l.e == r.e && l.f == r.f && l.g == r.g && l.h == r.h && l.i == r.i
+        }
+    }
+
+    private struct ScoredEntry {
+        let id: Int
+        let key: SortKey
+        let bestScore: Int
+        let quality: Int
+        let hasBase: Bool
+        var segmentMatches = 0
+    }
+
+    /// Per-entry bytes in the fixed-size section: masks + bnMasks + bnBoundaries (8 each), byteOffsets (4),
+    /// byteLengths + bnStarts (2 each), segCounts + isDirs (1 each).
+    private static let binaryBytesPerEntry = 34
+
+    // MARK: - Binary Persistence (fast load via mmap + memcpy)
+
+    // Binary format:
+    // [8]  magic: "CLINGIX3"
+    // [8]  entryCount: UInt64
+    // [8]  allBytesCount: UInt64
+    // [entryCount * 8]  masks: [UInt64]
+    // [entryCount * 8]  bnMasks: [UInt64]
+    // [entryCount * 8]  bnBoundaries: [UInt64]
+    // [entryCount * 4]  byteOffsets: [UInt32]  (max 4GB of path bytes)
+    // [entryCount * 2]  byteLengths: [UInt16]  (max 65535 bytes per path)
+    // [entryCount * 2]  bnStarts: [UInt16]
+    // [entryCount * 1]  segCounts: [UInt8]
+    // [entryCount * 1]  isDirs: [UInt8]        (0 or 1)
+    // [allBytesCount]   allBytes: [UInt8]       (lowercased path bytes)
+    // [remaining]       pathStrings: null-terminated UTF-8 strings concatenated
+
+    private static let binaryMagic: UInt64 = 0x3349_584E_494C_4C43 // "CLINGIX3" little-endian
+
+    private var extToID: [String: UInt16] = [:]
+    private var extHashToID: [UInt64: UInt16] = [:]
+    private var idToExt: [UInt16: String] = [:]
+    private var nextExtID: UInt16 = 1
+
+    private var masks: [UInt64] = []
+    private var bnMasks: [UInt64] = []
+    private var allBytes: [UInt8] = []
+    private var byteOffsets: [Int] = []
+    private var byteLengths: [Int] = []
+
+    private var extIDs: [UInt16] = [] // Extension ID per entry (0 = no extension)
+
+    private var free: [Int] = []
+    private var pathToID: [String: Int] = [:]
+    private var pathIndexBuilt = false
+    private var sortedByPath: [Int]?
+
+    /// Lock for thread-safe mutations during parallel walks
+    private let lock = NSLock()
+
+
+    /// The entry count and byte count come out of the file's own header, and every read below is an
+    /// unchecked `memcpy` or pointer walk against them. A crash or a full disk mid-write leaves a
+    /// truncated index whose header still claims the full size, so check the declared sizes fit the
+    /// file before reading a single byte of it: a bad index must lose to a re-index, not read off the
+    /// end of the map. The per-entry checks are folded into the loops that already read those values,
+    /// so this stays O(1) and index loading keeps its speed.
+    private static func binaryHeaderBounds(
+        rawN: UInt64, rawAllBytes: UInt64, totalLen: Int
+    ) -> (n: Int, allBytesCount: Int)? {
+        // Bound both counts while they are still UInt64. `Int(_: UInt64)` traps above Int.max, so
+        // converting first would crash on a garbage header before any bounds check could run. Every
+        // entry costs binaryBytesPerEntry in the fixed section plus at least a NUL terminator, and
+        // allBytes has to fit too, so the file's own size caps both.
+        guard rawN <= UInt64(totalLen / (binaryBytesPerEntry + 1)), rawAllBytes <= UInt64(totalLen) else {
+            return nil
+        }
+        let n = Int(rawN)
+        let allBytesCount = Int(rawAllBytes)
+        guard 24 + n * binaryBytesPerEntry + allBytesCount <= totalLen else { return nil }
+        return (n, allBytesCount)
+    }
+
+    /// Hash extension bytes into a UInt64 key (up to 8 bytes including the dot)
+    @inline(__always) private static func extHash(_ bytes: UnsafePointer<UInt8>, from dotPos: Int, len: Int) -> UInt64 {
+        var h: UInt64 = 0
+        let extLen = min(len - dotPos, 8)
+        var k = 0
+        while k < extLen {
+            h |= UInt64(bytes[dotPos + k]) << UInt64(k &* 8)
+            k &+= 1
+        }
+        return h
+    }
+
+    /// Binary search: first index in sorted where path >= prefix
+    private func sortedLowerBound(_ prefix: [UInt8], sorted: [Int]) -> Int {
+        var lo = 0, hi = sorted.count
+        while lo < hi {
+            let mid = lo &+ (hi &- lo) >> 1
+            let id = sorted[mid]
+            let off = byteOffsets[id], len = byteLengths[id]
+            let cmpLen = min(len, prefix.count)
+            var less = false
+            var j = 0
+            while j < cmpLen {
+                if allBytes[off + j] != prefix[j] {
+                    less = allBytes[off + j] < prefix[j]
+                    break
+                }
+                j &+= 1
+            }
+            if j == cmpLen { less = len < prefix.count }
+            if less { lo = mid &+ 1 } else { hi = mid }
+        }
+        return lo
+    }
+
+    /// Binary search: first index in sorted where path does NOT start with prefix
+    private func sortedUpperBound(_ prefix: [UInt8], sorted: [Int], from lower: Int) -> Int {
+        var lo = lower, hi = sorted.count
+        while lo < hi {
+            let mid = lo &+ (hi &- lo) >> 1
+            let id = sorted[mid]
+            let off = byteOffsets[id], len = byteLengths[id]
+            guard len >= prefix.count else { hi = mid; continue }
+            var starts = true
+            var j = 0
+            while j < prefix.count {
+                if allBytes[off + j] != prefix[j] { starts = false; break }
+                j &+= 1
+            }
+            if starts { lo = mid &+ 1 } else { hi = mid }
+        }
+        return lo
+    }
+
+    /// Compute extIDs for all entries that don't have one yet (after binary index load)
+    private func computeExtIDs() {
+        let n = entries.count
+        if extIDs.count < n {
+            extIDs.append(contentsOf: repeatElement(UInt16(0), count: n - extIDs.count))
+        }
+        allBytes.withUnsafeBufferPointer { buf in
+            let base = buf.baseAddress!
+            var i = 0
+            while i < n {
+                if extIDs[i] == 0, byteLengths[i] > 0 {
+                    extIDs[i] = extID(for: base + byteOffsets[i], len: byteLengths[i], bnStart: entries[i].bnStart)
+                }
+                i &+= 1
+            }
+        }
+        let extCount = extToID.count
+        slog.debug("computeExtIDs: \(extCount) unique extensions for \(n) entries")
+    }
+
+    /// Get or assign a numeric ID for a file extension using byte-level hashing
+    @inline(__always) private func extID(for bytes: UnsafePointer<UInt8>, len: Int, bnStart: Int) -> UInt16 {
+        // Scan backward from end to find last '.' in basename
+        var dotPos = -1
+        var k = len - 1
+        while k >= bnStart {
+            if bytes[k] == 0x2E { dotPos = k; break }
+            if bytes[k] == 0x2F { break }
+            k -= 1
+        }
+        guard dotPos >= 0, dotPos < len - 1 else { return 0 }
+
+        let h = Self.extHash(bytes, from: dotPos, len: len)
+
+        if let id = extHashToID[h] { return id }
+
+        let ext = String(decoding: UnsafeBufferPointer(start: bytes + dotPos, count: len - dotPos), as: UTF8.self)
+        let id = nextExtID
+        nextExtID &+= 1
+        extHashToID[h] = id
+        extToID[ext] = id
+        idToExt[id] = ext
+        return id
+    }
+
+    private func ensurePathIndex() {
+        guard !pathIndexBuilt else { return }
+        pathIndexBuilt = true
+        buildPathIndex()
+    }
+
+    // MARK: - Unlocked internals (caller must hold lock)
+
+    private func _addPath(_ path: String, isDir: Bool) -> Int {
+        ensurePathIndex()
+        if let existing = pathToID[path] { return existing }
+
+        let byteOff = allBytes.count
+        var bnStart = 0, segCount = 1
+        var mask: UInt64 = 0, bnMaskAccum: UInt64 = 0
+        var pathLen = 0
+        var boundaries: UInt64 = 0
+
+        // Use withUTF8 to avoid iterator overhead in debug builds
+        var _path = path
+        _path.withUTF8 { utf8 in
+            var p = 0
+            var prevCC: CC = .delim // treat start of path as delimiter boundary
+            while p < utf8.count {
+                let orig = utf8[p]
+                let low = toLowerByte(orig)
+                allBytes.append(low)
+                pathLen &+= 1
+
+                if low == 0x2F {
+                    segCount &+= 1
+                    bnStart = pathLen
+                    bnMaskAccum = 0
+                    boundaries = 0
+                    prevCC = .delim
+                } else {
+                    var bit: UInt64 = 0
+                    if low >= 0x61, low <= 0x7A { bit = 1 << UInt64(low &- 0x61) }
+                    else if low >= 0x30, low <= 0x39 { bit = 1 << UInt64(26 &+ low &- 0x30) }
+                    else if low == 0x2E { bit = 1 << 36 }
+                    else if low == 0x2D { bit = 1 << 37 }
+                    else if low == 0x5F { bit = 1 << 38 }
+                    mask |= bit
+                    bnMaskAccum |= bit
+
+                    // Compute word boundary from original case
+                    let curCC = ccTable[Int(orig)]
+                    let bnPos = pathLen - 1 - bnStart
+                    if bnPos < 64 {
+                        let isBoundary =
+                            (prevCC == .lower && curCC == .upper) || // camelCase
+                            (prevCC == .delim || prevCC == .white || prevCC == .nonWord) || // after delimiter
+                            (prevCC != .number && curCC == .number) || // letter->digit
+                            bnPos == 0 // start of basename
+                        if isBoundary { boundaries |= 1 << UInt64(bnPos) }
+                    }
+                    prevCC = curCC
+                }
+                p &+= 1
+            }
+        }
+
+        // Compute extension ID from the lowercased bytes in allBytes
+        let eid = allBytes.withUnsafeBufferPointer { buf in
+            extID(for: buf.baseAddress! + byteOff, len: pathLen, bnStart: bnStart)
+        }
+
+        let entry = Entry(
+            path: path,
+            isDir: isDir,
+            bnStart: bnStart,
+            segCount: segCount,
+            pathLen: pathLen
+        )
+        let id: Int
+        if let f = free.popLast() {
+            id = f
+            entries[id] = entry
+            masks[id] = mask
+            bnMasks[id] = bnMaskAccum
+            bnBoundaries[id] = boundaries
+            byteOffsets[id] = byteOff
+            byteLengths[id] = pathLen
+            extIDs[id] = eid
+        } else {
+            id = entries.count
+            entries.append(entry)
+            masks.append(mask)
+            bnMasks.append(bnMaskAccum)
+            bnBoundaries.append(boundaries)
+            byteOffsets.append(byteOff)
+            byteLengths.append(pathLen)
+            extIDs.append(eid)
+        }
+        pathToID[path] = id
+        return id
+    }
+
+    private func _removePath(_ path: String) -> Bool {
+        ensurePathIndex()
+        guard let id = pathToID.removeValue(forKey: path) else { return false }
+        entries[id] = Entry(path: "", isDir: false, bnStart: 0, segCount: 0, pathLen: 0)
+        masks[id] = 0
+        bnMasks[id] = 0
+        bnBoundaries[id] = 0
+        byteOffsets[id] = 0
+        byteLengths[id] = 0
+        extIDs[id] = 0
+        free.append(id)
+        return true
+    }
+
+    /// Bulk-add without pathToID dedup check (for initial load only).
+    /// Caller must hold the lock.
+    private func _bulkAddPath(_ path: String, isDir: Bool) {
+        let byteOff = allBytes.count
+        var bnStart = 0, segCount = 1
+        var mask: UInt64 = 0, bnMaskAccum: UInt64 = 0
+        var pathLen = 0
+
+        var _path = path
+        _path.withUTF8 { utf8 in
+            var p = 0
+            while p < utf8.count {
+                let low = toLowerByte(utf8[p])
+                allBytes.append(low)
+                pathLen &+= 1
+                if low == 0x2F {
+                    segCount &+= 1
+                    bnStart = pathLen
+                    bnMaskAccum = 0
+                } else {
+                    var bit: UInt64 = 0
+                    if low >= 0x61, low <= 0x7A { bit = 1 << UInt64(low &- 0x61) }
+                    else if low >= 0x30, low <= 0x39 { bit = 1 << UInt64(26 &+ low &- 0x30) }
+                    else if low == 0x2E { bit = 1 << 36 }
+                    else if low == 0x2D { bit = 1 << 37 }
+                    else if low == 0x5F { bit = 1 << 38 }
+                    mask |= bit
+                    bnMaskAccum |= bit
+                }
+                p &+= 1
+            }
+        }
+
+        entries.append(Entry(path: path, isDir: isDir, bnStart: bnStart, segCount: segCount, pathLen: pathLen))
+        masks.append(mask)
+        bnMasks.append(bnMaskAccum)
+        byteOffsets.append(byteOff)
+        byteLengths.append(pathLen)
+        let eid = allBytes.withUnsafeBufferPointer { buf in
+            extID(for: buf.baseAddress! + byteOff, len: pathLen, bnStart: bnStart)
+        }
+        extIDs.append(eid)
+    }
+
+}
