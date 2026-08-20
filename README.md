@@ -164,6 +164,12 @@ In a packaged synthetic benchmark with 30,000 matching files, earlier optimizati
 - Workflow upgrades normally preserve that data. Deleting only the workflow may leave its data available to Alfred; use Alfred’s workflow-data controls when you also want to remove the index and log.
 - Grant Alfred Full Disk Access only if you want results from protected locations.
 
+## Support the project
+
+If you like my project and find it useful for you, feel free to leave a tip.
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-Support-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=000000)](https://buymeacoffee.com/jmokos)
+
 ## Licensing and source
 
 Better Find is distributed as **GPL-3.0-only**, not AGPL. The Cling-derived engine is linked directly into the backend, so the combined current program is GPLv3. AGPL’s additional network-service source requirement provides no practical benefit for this local Unix-socket workflow.
