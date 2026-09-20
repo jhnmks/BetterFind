@@ -155,6 +155,16 @@ The hot path avoids process-heavy indexing work: the adapter performs IPC, query
 
 In a packaged synthetic benchmark with 30,000 matching files, earlier optimization work reduced a normal 100-result warm query from a 65 ms to 49 ms median, cold index readiness from 2.011 s to 1.364 s, and a deliberately heavy 1,000-result query from 450 ms to 142 ms on the same build Mac. These are comparative development measurements, not universal guarantees; root size, storage, permissions, query type, and Apple Silicon generation affect real performance.
 
+The development benchmark checks the bounded scorer against exhaustive scoring and exits nonzero if ordered results or ranking metadata differ:
+
+```zsh
+# Fixed query matrix over 250,000 generated entries
+swift run --build-system native -c release better-find-benchmark 250000
+
+# Add 60 generated stress queries and use a replayable corpus seed
+swift run --build-system native -c release better-find-benchmark 100000 60 1
+```
+
 ## Privacy and permissions
 
 - All indexing and matching happen locally.

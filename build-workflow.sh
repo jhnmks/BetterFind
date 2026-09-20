@@ -9,8 +9,13 @@ output_path="$dist_dir/BetterFind.alfredworkflow"
 source_root="$staging_dir/Source/BetterFind"
 
 cd "$project_dir"
-swift build -c release --arch arm64
-binary_dir="$(swift build -c release --arch arm64 --show-bin-path)"
+# Swift 6.4's default swiftbuild engine currently fails during initialization on
+# some macOS installations with "Unknown error parsing property list". The
+# native SwiftPM engine remains compatible with this package.
+build_args=(--build-system native -c release --arch arm64)
+swift build "${build_args[@]}" --product better-find
+swift build "${build_args[@]}" --product better-find-backend
+binary_dir="$(swift build "${build_args[@]}" --show-bin-path)"
 
 for executable in better-find better-find-backend; do
     architectures="$(/usr/bin/lipo -archs "$binary_dir/$executable")"
@@ -32,27 +37,17 @@ cp "LICENSES/Yams-MIT.txt" "$staging_dir/LICENSES/"
 cp "Vendor/ClingCore/LICENSE" "Vendor/ClingCore/UPSTREAM.md" "$staging_dir/Vendor/ClingCore/"
 
 # Bundle complete, rebuildable corresponding source with every distributed copy.
-# The source package uses a local Yams checkout, so rebuilding does not depend on
-# the remote package declaration used by this development repository.
+# Yams is vendored in the development repository, so the packaged source uses
+# the same local dependency graph and does not require network access.
 mkdir -p "$source_root/Vendor" "$source_root/LICENSES"
-/usr/bin/sed 's#\.package(url: "https://github.com/jpsim/Yams.git", exact: "6.2.2")#.package(path: "Vendor/Yams")#' \
-    "Package.swift" > "$source_root/Package.swift"
-cp "Package.resolved" "build-workflow.sh" "README.md" "LICENSE" "LICENSE-MIT" \
+cp "Package.swift" "build-workflow.sh" "README.md" "LICENSE" "LICENSE-MIT" \
     "COPYING.md" "SOURCE.md" "THIRD_PARTY_NOTICES.md" "$source_root/"
 cp -R "Sources" "Assets" "Workflow" "$source_root/"
-cp -R "Vendor/ClingCore" "$source_root/Vendor/"
+cp -R "Vendor/ClingCore" "Vendor/Yams" "$source_root/Vendor/"
 cp "LICENSES/Yams-MIT.txt" "$source_root/LICENSES/"
-
-if [[ -d "$project_dir/Vendor/Yams" ]]; then
-    yams_source="$project_dir/Vendor/Yams"
-elif [[ -d "$project_dir/.build/checkouts/Yams" ]]; then
-    yams_source="$project_dir/.build/checkouts/Yams"
-else
-    print -u2 "Yams source checkout is unavailable after dependency resolution"
-    exit 1
-fi
-cp -R "$yams_source" "$source_root/Vendor/Yams"
-rm -rf "$source_root/Vendor/Yams/.git"
+/usr/bin/find "$source_root/Vendor/Yams" -type d \
+    \( -name .git -o -name .build -o -name .swiftpm -o -name .agent-build -o -name .agent-build-native \) \
+    -prune -exec rm -rf {} +
 /usr/bin/find "$staging_dir" -name .DS_Store -delete
 
 chmod 755 "$staging_dir/better-find" "$staging_dir/better-find-backend" \

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // See LICENSE and Vendor/ClingCore/UPSTREAM.md.
 
+import Darwin
 import Foundation
 import simd
 #if canImport(Ignore)
@@ -156,30 +157,24 @@ private func rebuildBonusFlat() {
     bonusFlat = buildBonusFlat()
 }
 
-// MARK: - SIMD Helpers
+// MARK: - Byte Search Helpers
 
-/// Find first occurrence of `needle` byte in buffer starting at `from`, using SIMD16 (128-bit NEON).
+/// Find the first occurrence of `needle` in `base[from..<count]`. Tiny suffixes stay in
+/// Swift to avoid call overhead; longer scans use Darwin's architecture-tuned `memchr`.
 @inline(__always)
-private func simdFindByte(_ base: UnsafePointer<UInt8>, count: Int, needle: UInt8, from: Int) -> Int {
-    let needleVec = SIMD16<UInt8>(repeating: needle)
-    var i = from
-
-    while i &+ 16 <= count {
-        let block = UnsafeRawPointer(base + i).loadUnaligned(as: SIMD16<UInt8>.self)
-        let cmp = block .== needleVec
-        // Check if any lane matched
-        var lane = 0
-        while lane < 16 {
-            if cmp[lane] { return i &+ lane }
-            lane &+= 1
+func simdFindByte(_ base: UnsafePointer<UInt8>, count: Int, needle: UInt8, from: Int) -> Int {
+    guard from < count else { return -1 }
+    let remaining = count &- from
+    if remaining < 16 {
+        var index = from
+        while index < count {
+            if base[index] == needle { return index }
+            index &+= 1
         }
-        i &+= 16
+        return -1
     }
-    while i < count {
-        if base[i] == needle { return i }
-        i &+= 1
-    }
-    return -1
+    guard let match = memchr(base + from, Int32(needle), remaining) else { return -1 }
+    return base.distance(to: match.assumingMemoryBound(to: UInt8.self))
 }
 
 /// SIMD-accelerated substring search: locate `needle` in `base[0..<count]` by SIMD-scanning
@@ -469,7 +464,8 @@ struct SearchResult: Comparable {
         if lr != rr { return lr < rr }
         if lhs.score != rhs.score { return lhs.score < rhs.score }
         if lhs.depth != rhs.depth { return lhs.depth > rhs.depth }
-        return lhs.path.count > rhs.path.count
+        if lhs.path.count != rhs.path.count { return lhs.path.count > rhs.path.count }
+        return lhs.path > rhs.path
     }
 }
 
@@ -487,6 +483,13 @@ final class SearchEngine: @unchecked Sendable {
     private(set) var entries: [Entry] = []
 
     private(set) var bnBoundaries: [UInt64] = [] // bit N = 1 means basename byte N is a word boundary (camelCase, delimiter, etc.)
+
+    private let importanceHomePrefix = Array(NSHomeDirectory().lowercased().utf8)
+    private let importanceLibraryPrefix = Array((NSHomeDirectory().lowercased() + "/library").utf8)
+    private let importancePrefixes = [
+        "/documents", "/desktop", "/downloads", "/projects", "/temp",
+        "/music", "/movies", "/pictures", "/library/mobile documents",
+    ].map { Array((NSHomeDirectory().lowercased() + $0).utf8) } + [Array("/applications".utf8)]
 
     var count: Int {
         lock.withLock { entries.count - free.count }
@@ -526,6 +529,7 @@ final class SearchEngine: @unchecked Sendable {
             byteOffsets.reserveCapacity(n)
             byteLengths.reserveCapacity(n)
             extIDs.reserveCapacity(n)
+            pathMetadata.reserveCapacity(n)
             allBytes.reserveCapacity(n * avgPathLen)
         }
     }
@@ -573,6 +577,7 @@ final class SearchEngine: @unchecked Sendable {
             byteOffsets.removeAll()
             byteLengths.removeAll()
             extIDs.removeAll()
+            pathMetadata.removeAll()
             extToID.removeAll()
             extHashToID.removeAll()
             idToExt.removeAll()
@@ -829,6 +834,7 @@ final class SearchEngine: @unchecked Sendable {
             }
 
             computeExtIDs()
+            rebuildPathMetadata()
             pathIndexBuilt = false
             sortedByPath = nil
             lock.unlock()
@@ -957,6 +963,7 @@ final class SearchEngine: @unchecked Sendable {
 
             // Append under lock, shifting byteOffsets by current allBytes size
             lock.lock()
+            let firstAppendedEntry = entries.count
             let baseOffset = allBytes.count
             i = 0
             while i < n {
@@ -971,6 +978,22 @@ final class SearchEngine: @unchecked Sendable {
             byteLengths.append(contentsOf: newByteLengths)
             allBytes.append(contentsOf: newAllBytes)
             computeExtIDs()
+            if pathMetadata.count < entries.count {
+                pathMetadata.append(contentsOf: repeatElement(UInt8(0), count: entries.count - pathMetadata.count))
+            }
+            allBytes.withUnsafeBufferPointer { buffer in
+                let base = buffer.baseAddress!
+                var entryIndex = firstAppendedEntry
+                while entryIndex < entries.count {
+                    pathMetadata[entryIndex] = pathMetadataByte(
+                        base,
+                        off: byteOffsets[entryIndex],
+                        len: byteLengths[entryIndex],
+                        bnStart: entries[entryIndex].bnStart
+                    )
+                    entryIndex &+= 1
+                }
+            }
             pathIndexBuilt = false
             sortedByPath = nil
             lock.unlock()
@@ -1076,7 +1099,6 @@ final class SearchEngine: @unchecked Sendable {
         }
         let readMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
 
-        let t1 = CFAbsoluteTimeGetCurrent()
         var entryCount = 0
 
         data.withUnsafeBytes { buf in
@@ -1207,12 +1229,14 @@ final class SearchEngine: @unchecked Sendable {
             let stringMs = (CFAbsoluteTimeGetCurrent() - t_strings) * 1000
             slog.debug("loadIndex: created \(entryCount) strings in \(stringMs, format: .fixed(precision: 1))ms")
 
+            rebuildPathMetadata()
             pathIndexBuilt = false
             sortedByPath = nil
             lock.unlock()
         }
 
-        let parseMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000
+        let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        let parseMs = max(totalMs - readMs, 0)
         slog.info("loadIndex: \(entryCount) entries, read=\(readMs, format: .fixed(precision: 1))ms parse=\(parseMs, format: .fixed(precision: 1))ms")
         return entryCount > 0
     }
@@ -1663,7 +1687,8 @@ final class SearchEngine: @unchecked Sendable {
         candidatePool: [Int]? = nil,
         literalDefault: Bool = false,
         parseOperators: Bool = true,
-        cancelled: (() -> Bool)? = nil
+        cancelled: (() -> Bool)? = nil,
+        exhaustiveScoring: Bool = false
     ) -> [SearchResult] {
         let t0 = CFAbsoluteTimeGetCurrent()
 
@@ -1985,7 +2010,12 @@ final class SearchEngine: @unchecked Sendable {
         ///   1 = system/root visible
         ///   0 = hidden (dotfile/dotdir anywhere in the path)
         @inline(__always)
-        func computePathImportance(_ allBase: UnsafePointer<UInt8>, _ off: Int, _ len: Int, _ bnOff: Int) -> Int32 {
+        func computePathImportance(_ id: Int, _ allBase: UnsafePointer<UInt8>, _ off: Int, _ len: Int, _ bnOff: Int) -> Int32 {
+            if !exhaustiveScoring {
+                let metadata = pathMetadata[id]
+                if !queryHasDot, metadata & Self.hiddenPathMetadataBit != 0 { return 0 }
+                return Int32(metadata & 0x07)
+            }
             let isHidden: Bool = !queryHasDot && {
                 if bnOff < len, allBase[off + bnOff] == 0x2E { return true }
                 var p = 0
@@ -2343,138 +2373,152 @@ final class SearchEngine: @unchecked Sendable {
             return true
         }
 
-        if let pool = candidatePool {
-            // Pre-filtered candidate pool (from QuickFilter prefilter)
-            // suffix/dirsOnly already applied, also apply folder prefix + mask + excluded
-            //
-            // The pool is a snapshot of entry indices captured by prefilter() against the engine
-            // as it was then. A reindex/reload since then (clear() or loadBinaryIndex()) can have
-            // replaced the parallel arrays with a shorter set, leaving stale indices that now point
-            // past the end. All parallel arrays are length n under the lock, so n is the authoritative
-            // bound: skip anything out of range rather than trapping on masks[i]/byteOffsets[i]/etc.
-            var pi = 0
-            while pi < pool.count {
-                let i = pool[pi]
-                if i >= 0, i < n, applyBaseFilters(i), matchesFolderPrefix(i), depthOK(i) { cands.append(i) }
-                pi &+= 1
-            }
-        } else if let prefixBytes = folderPrefixBytes, let sorted = sortedByPath {
-            // Fast path: O(log n + k) prefix lookup via sorted index (built lazily)
-            var pxi = 0
-            while pxi < prefixBytes.count {
-                let prefix = prefixBytes[pxi]
-                let lo = sortedLowerBound(prefix, sorted: sorted)
-                let hi = sortedUpperBound(prefix, sorted: sorted, from: lo)
-                var idx = lo
-                while idx < hi {
-                    let i = sorted[idx]
-                    // The [lo, hi) range matches the prefix loosely (includes the folder itself and
-                    // prefix-siblings); strictlyInside keeps only true descendants.
-                    if strictlyInside(byteOffsets[i], byteLengths[i], prefix), applyAllFilters(i), depthOK(i) { cands.append(i) }
-                    idx &+= 1
+        allBytes.withUnsafeBufferPointer { allBuffer in
+            let allBase = allBuffer.baseAddress!
+            @inline(__always) func appendIfOperatorsPass(_ i: Int, to candidates: inout [Int]) {
+                if exhaustiveScoring || !hasOperators || passesOperators(i, allBase) {
+                    candidates.append(i)
                 }
-                pxi &+= 1
             }
-        } else {
-            // Parallel full scan across CPU cores
-            let filterProcs = max(ProcessInfo.processInfo.activeProcessorCount, 1)
-            let filterChunkSize = (n + filterProcs - 1) / filterProcs
-            let filterChunks = (n + filterChunkSize - 1) / filterChunkSize
-            let candStore = UnsafeMutablePointer<[Int]>.allocate(capacity: max(filterChunks, 1))
-            candStore.initialize(repeating: [], count: max(filterChunks, 1))
-            defer { candStore.deinitialize(count: max(filterChunks, 1)); candStore.deallocate() }
 
-            masks.withUnsafeBufferPointer { maskBuf in
-                let maskPtr = maskBuf.baseAddress!
-                DispatchQueue.concurrentPerform(iterations: filterChunks) { chunk in
-                    let lo = chunk * filterChunkSize
-                    let hi = min(lo + filterChunkSize, n)
-                    var local = [Int]()
-                    local.reserveCapacity((hi - lo) / 10)
-
-                    var i = lo
-                    while i < hi {
-                        if hasFuzzyQuery {
-                            if maskPtr[i] & combinedMask != combinedMask { i &+= 1; continue }
-                        } else {
-                            if maskPtr[i] == 0 { i &+= 1; continue }
-                        }
-                        if let excl = excludedIDs, excl.contains(i) { i &+= 1; continue }
-
-                        let off = byteOffsets[i]
-                        let len = byteLengths[i]
-
-                        // Extension filter (disjunctive): keep only entries matching ANY queried extension.
-                        if hasExtFilter, !extensionMatches(self.extIDs[i], off, len) { i &+= 1; continue }
-
-                        if let prefixes = folderPrefixBytes {
-                            var matched = false
-                            var pi = 0
-                            while pi < prefixes.count {
-                                if strictlyInside(off, len, prefixes[pi]) { matched = true; break }
-                                pi &+= 1
-                            }
-                            if !matched { i &+= 1; continue }
-                        }
-
-                        if let prefixes = excludedPrefixBytes {
-                            var excluded = false
-                            var pi = 0
-                            while pi < prefixes.count {
-                                let prefix = prefixes[pi]
-                                if len >= prefix.count {
-                                    var ok = true
-                                    var j = 0
-                                    while j < prefix.count {
-                                        if allBytes[off + j] != prefix[j] { ok = false; break }
-                                        j &+= 1
-                                    }
-                                    if ok { excluded = true; break }
-                                }
-                                pi &+= 1
-                            }
-                            if excluded { i &+= 1; continue }
-                        }
-
-                        if dirsOnly, !entries[i].isDir { i &+= 1; continue }
-
-                        if let sfx = suffixBytes {
-                            if len < sfx.count { i &+= 1; continue }
-                            var match = true
-                            var j = 0
-                            while j < sfx.count {
-                                if allBytes[off + len - sfx.count + j] != sfx[j] { match = false; break }
-                                j &+= 1
-                            }
-                            if !match { i &+= 1; continue }
-                        }
-
-                        // Dir segment match (descendant substring + folder-self), shared helper.
-                        if !dirSegMatches(i) { i &+= 1; continue }
-
-                        if !depthOK(i) { i &+= 1; continue }
-
-                        local.append(i)
-                        i &+= 1
+            if let pool = candidatePool {
+                // Pre-filtered candidate pool (from QuickFilter prefilter)
+                // suffix/dirsOnly already applied, also apply folder prefix + mask + excluded
+                //
+                // The pool is a snapshot of entry indices captured by prefilter() against the engine
+                // as it was then. A reindex/reload since then (clear() or loadBinaryIndex()) can have
+                // replaced the parallel arrays with a shorter set, leaving stale indices that now point
+                // past the end. All parallel arrays are length n under the lock, so n is the authoritative
+                // bound: skip anything out of range rather than trapping on masks[i]/byteOffsets[i]/etc.
+                var pi = 0
+                while pi < pool.count {
+                    let i = pool[pi]
+                    if i >= 0, i < n, applyBaseFilters(i), matchesFolderPrefix(i), depthOK(i) {
+                        appendIfOperatorsPass(i, to: &cands)
                     }
-                    candStore[chunk] = local
+                    pi &+= 1
                 }
-            }
+            } else if let prefixBytes = folderPrefixBytes, let sorted = sortedByPath {
+                // Fast path: O(log n + k) prefix lookup via sorted index (built lazily)
+                var pxi = 0
+                while pxi < prefixBytes.count {
+                    let prefix = prefixBytes[pxi]
+                    let lo = sortedLowerBound(prefix, sorted: sorted)
+                    let hi = sortedUpperBound(prefix, sorted: sorted, from: lo)
+                    var idx = lo
+                    while idx < hi {
+                        let i = sorted[idx]
+                        // The [lo, hi) range matches the prefix loosely (includes the folder itself and
+                        // prefix-siblings); strictlyInside keeps only true descendants.
+                        if strictlyInside(byteOffsets[i], byteLengths[i], prefix), applyAllFilters(i), depthOK(i) {
+                            appendIfOperatorsPass(i, to: &cands)
+                        }
+                        idx &+= 1
+                    }
+                    pxi &+= 1
+                }
+            } else {
+                // Parallel full scan across CPU cores
+                let filterProcs = min(max(ProcessInfo.processInfo.activeProcessorCount, 1), 4)
+                let filterChunkSize = (n + filterProcs - 1) / filterProcs
+                let filterChunks = (n + filterChunkSize - 1) / filterChunkSize
+                let candStore = UnsafeMutablePointer<[Int]>.allocate(capacity: max(filterChunks, 1))
+                candStore.initialize(repeating: [], count: max(filterChunks, 1))
+                defer { candStore.deinitialize(count: max(filterChunks, 1)); candStore.deallocate() }
 
-            // Merge chunk results
-            var ci = 0
-            while ci < filterChunks {
-                cands.append(contentsOf: candStore[ci])
-                ci &+= 1
+                masks.withUnsafeBufferPointer { maskBuf in
+                    let maskPtr = maskBuf.baseAddress!
+                    DispatchQueue.concurrentPerform(iterations: filterChunks) { chunk in
+                        let lo = chunk * filterChunkSize
+                        let hi = min(lo + filterChunkSize, n)
+                        var local = [Int]()
+                        local.reserveCapacity((hi - lo) / 10)
+
+                        var i = lo
+                        while i < hi {
+                            if hasFuzzyQuery {
+                                if maskPtr[i] & combinedMask != combinedMask { i &+= 1; continue }
+                            } else {
+                                if maskPtr[i] == 0 { i &+= 1; continue }
+                            }
+                            if let excl = excludedIDs, excl.contains(i) { i &+= 1; continue }
+
+                            let off = byteOffsets[i]
+                            let len = byteLengths[i]
+
+                            // Extension filter (disjunctive): keep only entries matching ANY queried extension.
+                            if hasExtFilter, !extensionMatches(self.extIDs[i], off, len) { i &+= 1; continue }
+
+                            if let prefixes = folderPrefixBytes {
+                                var matched = false
+                                var pi = 0
+                                while pi < prefixes.count {
+                                    if strictlyInside(off, len, prefixes[pi]) { matched = true; break }
+                                    pi &+= 1
+                                }
+                                if !matched { i &+= 1; continue }
+                            }
+
+                            if let prefixes = excludedPrefixBytes {
+                                var excluded = false
+                                var pi = 0
+                                while pi < prefixes.count {
+                                    let prefix = prefixes[pi]
+                                    if len >= prefix.count {
+                                        var ok = true
+                                        var j = 0
+                                        while j < prefix.count {
+                                            if allBase[off + j] != prefix[j] { ok = false; break }
+                                            j &+= 1
+                                        }
+                                        if ok { excluded = true; break }
+                                    }
+                                    pi &+= 1
+                                }
+                                if excluded { i &+= 1; continue }
+                            }
+
+                            if dirsOnly, !entries[i].isDir { i &+= 1; continue }
+
+                            if let sfx = suffixBytes {
+                                if len < sfx.count { i &+= 1; continue }
+                                var match = true
+                                var j = 0
+                                while j < sfx.count {
+                                    if allBase[off + len - sfx.count + j] != sfx[j] { match = false; break }
+                                    j &+= 1
+                                }
+                                if !match { i &+= 1; continue }
+                            }
+
+                            // Dir segment match (descendant substring + folder-self), shared helper.
+                            if !dirSegMatches(i) { i &+= 1; continue }
+
+                            if !depthOK(i) { i &+= 1; continue }
+                            if !exhaustiveScoring, hasOperators, !passesOperators(i, allBase) { i &+= 1; continue }
+
+                            local.append(i)
+                            i &+= 1
+                        }
+                        candStore[chunk] = local
+                    }
+                }
+
+                // Merge chunk results. Operator-rejected IDs never enter the stored arrays, avoiding
+                // a second allocation and full pass over the merged candidate union.
+                var ci = 0
+                while ci < filterChunks {
+                    cands.append(contentsOf: candStore[ci])
+                    ci &+= 1
+                }
             }
         }
-        // Apply fzf-style operators (negation, literal, anchors, files-only) in one SIMD pass
-        // over the assembled candidate list. Positive operator letters are already in
-        // combinedMask, so most non-matches were pruned upstream; this confirms substrings and
-        // rejects negated matches before scoring and before the extension-only fast path.
-        if hasOperators, !cands.isEmpty {
-            allBytes.withUnsafeBufferPointer { buf in
-                let allBase = buf.baseAddress!
+        // Exhaustive mode preserves the former post-merge operator pass as a differential oracle.
+        // Production fused the same predicate into candidate collection above, so rejected IDs never
+        // consume candidate-array capacity or require a second full pass.
+        if exhaustiveScoring, hasOperators, !cands.isEmpty {
+            allBytes.withUnsafeBufferPointer { buffer in
+                let allBase = buffer.baseAddress!
                 cands = cands.filter { passesOperators($0, allBase) }
             }
         }
@@ -2567,45 +2611,71 @@ final class SearchEngine: @unchecked Sendable {
         }
 
         if qBytes.isEmpty, dirSegments.isEmpty {
-            // Extension-only filter: keep only entries matching the extension
-            if !extTokenBytes.isEmpty {
-                var extFiltered = [Int]()
-                extFiltered.reserveCapacity(cands.count / 10)
-                var ci = 0
-                while ci < cands.count {
-                    let id = cands[ci]
-                    if extensionMatches(extIDs[id], byteOffsets[id], byteLengths[id]) { extFiltered.append(id) }
-                    ci &+= 1
+            // Every candidate source already applied the disjunctive extension filter.
+            // Rank exact extension matches by importance, depth, and path byte length.
+            let selectionLimit = max(maxResults, 0)
+            var selected: [ExtensionScoredEntry]
+            if exhaustiveScoring {
+                selected = []
+                selected.reserveCapacity(cands.count)
+                allBytes.withUnsafeBufferPointer { buf in
+                    let allBase = buf.baseAddress!
+                    for id in cands {
+                        selected.append(ExtensionScoredEntry(
+                            id: id,
+                            importance: computePathImportance(
+                                id,
+                                allBase,
+                                byteOffsets[id],
+                                byteLengths[id],
+                                entries[id].bnStart
+                            ),
+                            depth: entries[id].segCount,
+                            byteLength: byteLengths[id]
+                        ))
+                    }
                 }
-                cands = extFiltered
-            }
-
-            // Rank: important locations first (so user media beats shallow system/app noise),
-            // then shallower paths, then shorter paths. Importance is precomputed once per
-            // candidate and also written into each SearchResult, so the cross-engine merge's
-            // re-sort by rank preserves this ordering instead of collapsing everything to rank 0.
-            var imp = [Int32](repeating: 1, count: cands.count)
-            allBytes.withUnsafeBufferPointer { buf in
-                let allBase = buf.baseAddress!
-                var ci = 0
-                while ci < cands.count {
-                    let id = cands[ci]
-                    imp[ci] = computePathImportance(allBase, byteOffsets[id], byteLengths[id], entries[id].bnStart)
-                    ci &+= 1
+                selected.sort(by: extensionEntryComesBefore)
+                if selected.count > selectionLimit {
+                    selected.removeSubrange(selectionLimit ..< selected.count)
                 }
+            } else {
+                var collector = BoundedExtensionCollector(
+                    limit: selectionLimit,
+                    estimatedCount: cands.count
+                )
+                allBytes.withUnsafeBufferPointer { buf in
+                    let allBase = buf.baseAddress!
+                    for id in cands {
+                        collector.insert(ExtensionScoredEntry(
+                            id: id,
+                            importance: computePathImportance(
+                                id,
+                                allBase,
+                                byteOffsets[id],
+                                byteLengths[id],
+                                entries[id].bnStart
+                            ),
+                            depth: entries[id].segCount,
+                            byteLength: byteLengths[id]
+                        ))
+                    }
+                }
+                selected = collector.results.sorted(by: extensionEntryComesBefore)
             }
-            // Sort an index permutation so `imp` stays aligned with its candidate.
-            var order = Array(0 ..< cands.count)
-            order.sort { x, y in
-                if imp[x] != imp[y] { return imp[x] > imp[y] }
-                let aSeg = entries[cands[x]].segCount, bSeg = entries[cands[y]].segCount
-                if aSeg != bSeg { return aSeg < bSeg }
-                return byteLengths[cands[x]] < byteLengths[cands[y]]
-            }
-            let results = order.prefix(maxResults).map { oi -> SearchResult in
-                let id = cands[oi]
-                let e = entries[id]
-                return SearchResult(path: e.path, isDir: e.isDir, score: 0, quality: 0, hasBase: false, segmentMatches: 0, pathImportance: Int(imp[oi]), prefixMatch: false, depth: e.segCount)
+            let results = selected.map { item -> SearchResult in
+                let entry = entries[item.id]
+                return SearchResult(
+                    path: entry.path,
+                    isDir: entry.isDir,
+                    score: 0,
+                    quality: 0,
+                    hasBase: false,
+                    segmentMatches: 0,
+                    pathImportance: Int(item.importance),
+                    prefixMatch: false,
+                    depth: entry.segCount
+                )
             }
             let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
             slog.debug("search: q=\"\(query)\" \(n) entries, \(cands.count) cands, \(results.count) results in \(totalMs, format: .fixed(precision: 1))ms (filter=\(filterMs, format: .fixed(precision: 1))ms)")
@@ -2617,23 +2687,109 @@ final class SearchEngine: @unchecked Sendable {
         if isCancelled() { return [] }
 
         let nCands = cands.count
-        let nProcs = max(ProcessInfo.processInfo.activeProcessorCount, 1)
+        let maxResultsCount = max(maxResults, 1)
+        let overscan = 4
+        let scoreLimit = maxResultsCount * overscan
+        let dirSegmentTotalLength = dirSegments.reduce(0) { $0 + $1.count }
+        let effectiveQueryLength = qBytes.isEmpty ? dirSegmentTotalLength : qBytes.count
+        let nProcs = searchWorkerCount(candidateCount: nCands, queryLength: qBytes.count, hasOperators: hasOperators, hasFolderPrefixes: folderPrefixBytes != nil, hasDirSegments: !dirSegments.isEmpty)
         let chunkSize = max(nCands / nProcs, 512)
         let nChunks = nCands == 0 ? 0 : (nCands + chunkSize - 1) / chunkSize
-        let chunkStore = UnsafeMutablePointer<[ScoredEntry]>.allocate(capacity: max(nChunks, 1))
-        chunkStore.initialize(repeating: [], count: max(nChunks, 1))
+        let chunkStore = UnsafeMutablePointer<BoundedScoredCollector>.allocate(capacity: max(nChunks, 1))
+        let collectorLimit = exhaustiveScoring ? Int.max : scoreLimit
+        chunkStore.initialize(repeating: BoundedScoredCollector(limit: collectorLimit), count: max(nChunks, 1))
         defer { chunkStore.deinitialize(count: max(nChunks, 1)); chunkStore.deallocate() }
 
         allBytes.withUnsafeBufferPointer { allBuf in
             let allBase = allBuf.baseAddress!
+
+            @inline(__always) func exactBytesMatch(
+                _ needle: UnsafeBufferPointer<UInt8>,
+                basenameBase: UnsafePointer<UInt8>,
+                basenameLength: Int,
+                at position: Int
+            ) -> Bool {
+                position >= 0 && position + needle.count <= basenameLength
+                    && memcmp(basenameBase + position, needle.baseAddress!, needle.count) == 0
+            }
+
+            @inline(__always) func hasDelimiterBoundaryMatch(
+                _ needle: UnsafeBufferPointer<UInt8>,
+                basenameBase: UnsafePointer<UInt8>,
+                basenameLength: Int,
+                boundaries: UInt64
+            ) -> Bool {
+                // A straight scan wins for ordinary short filenames. Boundary bits pay off once the
+                // basename is long enough that skipping non-boundary bytes outweighs bit iteration.
+                if basenameLength <= 48 {
+                    var position = 1
+                    while position + needle.count <= basenameLength {
+                        let previous = basenameBase[position - 1]
+                        if previous == 0x20 || previous == 0x2D || previous == 0x5F
+                            || previous == 0x2E || previous == 0x2F,
+                           exactBytesMatch(
+                               needle,
+                               basenameBase: basenameBase,
+                               basenameLength: basenameLength,
+                               at: position
+                           )
+                        {
+                            return true
+                        }
+                        position &+= 1
+                    }
+                    return false
+                }
+
+                var candidates = boundaries & ~UInt64(1)
+                while candidates != 0 {
+                    let position = candidates.trailingZeroBitCount
+                    candidates &= candidates &- 1
+                    guard position + needle.count <= basenameLength else { continue }
+                    let previous = basenameBase[position - 1]
+                    if previous == 0x20 || previous == 0x2D || previous == 0x5F
+                        || previous == 0x2E || previous == 0x2F,
+                       exactBytesMatch(
+                           needle,
+                           basenameBase: basenameBase,
+                           basenameLength: basenameLength,
+                           at: position
+                       )
+                    {
+                        return true
+                    }
+                }
+
+                // Boundary metadata covers the first 64 basename bytes. Preserve exact behavior for
+                // unusually long names by scanning only the uncovered tail.
+                var position = max(64, 1)
+                while position + needle.count <= basenameLength {
+                    let previous = basenameBase[position - 1]
+                    if previous == 0x20 || previous == 0x2D || previous == 0x5F
+                        || previous == 0x2E || previous == 0x2F,
+                       exactBytesMatch(
+                           needle,
+                           basenameBase: basenameBase,
+                           basenameLength: basenameLength,
+                           at: position
+                       )
+                    {
+                        return true
+                    }
+                    position &+= 1
+                }
+                return false
+            }
 
             qBytes.withUnsafeBufferPointer { qBuf in
                 baseBytes.withUnsafeBufferPointer { baseBuf in
                     DispatchQueue.concurrentPerform(iterations: nChunks) { chunk in
                         let lo = chunk * chunkSize
                         let hi = min(lo + chunkSize, nCands)
-                        var local = [ScoredEntry]()
-                        local.reserveCapacity(hi - lo)
+                        var collector = BoundedScoredCollector(
+                            limit: collectorLimit,
+                            estimatedCount: hi - lo
+                        )
                         var idx = lo
                         while idx < hi {
                             if idx & 0x1FF == 0, isCancelled() { break }
@@ -2663,10 +2819,6 @@ final class SearchEngine: @unchecked Sendable {
                                     pathScore = r.score; pathWindow = r.end - r.start
                                 }
 
-                                // Multi-token independent scoring: score each token separately against
-                                // non-overlapping regions. Each token must match after the previous token's
-                                // match end, so "prv sky" matches "PrivateFrameworks/SkyLight" but each
-                                // token occupies a distinct path segment.
                                 if let tokens = tokenBytes {
                                     var tokenPathScore = 0, tokenPathStart = Int.max, tokenPathEnd = 0
                                     var allTokensMatchPath = true
@@ -2677,15 +2829,10 @@ final class SearchEngine: @unchecked Sendable {
                                             allTokensMatchPath = false; break
                                         }
                                         let slice = UnsafeBufferPointer(start: allBase + off + pathSearchFrom, count: len - pathSearchFrom)
-                                        // May go negative once pathSearchFrom passes bnOff: bpos = i - boff
-                                        // must stay basename-relative, and fuzzyScoreBytes guards 0..<64.
                                         let boff = bnOff - pathSearchFrom
                                         var r = token.withUnsafeBufferPointer {
                                             fuzzyScoreBytes($0, slice, boundaries: bnBounds, boundariesOffset: boff)
                                         }
-                                        // NFC fallback: the stored path may be in the other normalization form.
-                                        // Scale the score up to the NFD byte length so NFC-stored paths rank
-                                        // on the same scale as NFD-stored twins (NFD hangul is ~2x the bytes).
                                         if r == nil, let alt = tokenAltBytes[ti] {
                                             r = alt.withUnsafeBufferPointer {
                                                 fuzzyScoreBytes($0, slice, boundaries: bnBounds, boundariesOffset: boff)
@@ -2700,7 +2847,6 @@ final class SearchEngine: @unchecked Sendable {
                                             let absEnd = pathSearchFrom + r.end
                                             tokenPathStart = min(tokenPathStart, absStart)
                                             tokenPathEnd = max(tokenPathEnd, absEnd)
-                                            // Check if match starts at a segment boundary (after / or start of path)
                                             if absStart == 0 || allBase[off + absStart - 1] == 0x2F {
                                                 tokenSegMatches &+= 1
                                             }
@@ -2721,8 +2867,6 @@ final class SearchEngine: @unchecked Sendable {
                                             allTokensMatchBase = false; break
                                         }
                                         let slice = UnsafeBufferPointer(start: allBase + off + bnOff + baseSearchFrom, count: bnLen - baseSearchFrom)
-                                        // Slice byte i is basename byte i + baseSearchFrom, so the offset is
-                                        // negative: bpos = i - (-baseSearchFrom) = i + baseSearchFrom.
                                         var r = token.withUnsafeBufferPointer {
                                             fuzzyScoreBytes($0, slice, boundaries: bnBounds, boundariesOffset: -baseSearchFrom)
                                         }
@@ -2746,11 +2890,9 @@ final class SearchEngine: @unchecked Sendable {
                                     }
                                 }
 
-                                // NFC fallback for Unicode paths that differ in normalization
                                 if baseScore == Int.min, pathScore == Int.min, let altQ = qAltBytes, let altBase = baseAltBytes {
                                     altQ.withUnsafeBufferPointer { altQBuf in
                                         altBase.withUnsafeBufferPointer { altBaseBuf in
-                                            // Same NFD-scale normalization as the per-token fallback above.
                                             if let r = fuzzyScoreBytes(altBaseBuf, bnBuf, boundaries: bnBounds) {
                                                 baseScore = r.score * baseBytes.count / altBase.count; baseWindow = r.end - r.start
                                             }
@@ -2765,91 +2907,122 @@ final class SearchEngine: @unchecked Sendable {
                                 hasPath = pathScore > Int.min
                                 guard hasBase || hasPath else { idx &+= 1; continue }
                             } else if !dirSegments.isEmpty {
-                                // Dir-segment-only query: score based on path brevity
-                                // (dir segment already verified as literal match in candidate filter)
-                                let dirSegLen = dirSegments.reduce(0) { $0 + $1.count }
-                                pathScore = dirSegLen * 16 // scoreMatch per char
+                                pathScore = dirSegmentTotalLength * 16
                                 pathWindow = len
                                 hasBase = false
                                 hasPath = true
                             } else {
-                                // Extension-only query: no fuzzy match needed
                                 hasBase = false
                                 hasPath = false
                             }
 
                             let sHasBase = Int32(hasSlash ? 0 : (hasBase ? 1 : 0))
-
-                            // Path importance (see computePathImportance, defined above): lifts
-                            // user/media dirs above system noise; hidden paths sink to 0.
-                            let sPathImportance = computePathImportance(allBase, off, len, bnOff)
-
-                            // Prefix/extension match
+                            let sPathImportance = computePathImportance(id, allBase, off, len, bnOff)
                             let sPrefixMatch: Int32
                             let bnLen = len - e.bnStart
+                            let basenameBoundaries = self.bnBoundaries[id]
 
-                            // Check extension tokens against entry's extension ID (O(1)) or fallback to byte suffix
-                            var extOK = false
-                            if !extTokenIDs.isEmpty {
-                                let eid = self.extIDs[id]
-                                var ei = 0
-                                while ei < extTokenIDs.count {
-                                    if eid == extTokenIDs[ei] { extOK = true; break }
-                                    ei &+= 1
-                                }
-                            } else if !extTokenBytes.isEmpty {
-                                var ei = 0
-                                while ei < extTokenBytes.count {
-                                    let ext = extTokenBytes[ei]
-                                    if bnLen >= ext.count {
-                                        var match = true
-                                        var p = 0
-                                        while p < ext.count {
-                                            if allBase[off + e.bnStart + bnLen - ext.count + p] != ext[p] { match = false; break }
-                                            p &+= 1
+                            // Every candidate source applied extensionMatches before scoring. Production
+                            // can hoist that invariant; exhaustive mode retains the old ID/suffix recheck as
+                            // a differential oracle proving that every candidate source enforces it.
+                            let extOK: Bool
+                            if exhaustiveScoring, hasExtFilter {
+                                var matched = false
+                                if !extTokenIDs.isEmpty {
+                                    let extensionID = self.extIDs[id]
+                                    var extensionIndex = 0
+                                    while extensionIndex < extTokenIDs.count {
+                                        if extensionID == extTokenIDs[extensionIndex] {
+                                            matched = true
+                                            break
                                         }
-                                        if match { extOK = true; break }
+                                        extensionIndex &+= 1
                                     }
-                                    ei &+= 1
+                                } else {
+                                    var extensionIndex = 0
+                                    while extensionIndex < extTokenBytes.count {
+                                        let ext = extTokenBytes[extensionIndex]
+                                        if bnLen >= ext.count {
+                                            var suffixMatches = true
+                                            var position = 0
+                                            while position < ext.count {
+                                                if allBase[off + e.bnStart + bnLen - ext.count + position] != ext[position] {
+                                                    suffixMatches = false
+                                                    break
+                                                }
+                                                position &+= 1
+                                            }
+                                            if suffixMatches {
+                                                matched = true
+                                                break
+                                            }
+                                        }
+                                        extensionIndex &+= 1
+                                    }
                                 }
+                                extOK = matched
+                            } else {
+                                extOK = hasExtFilter
                             }
 
                             if let tokens = tokenBytes, hasBase {
-                                // Multi-token: check each token as literal substring at word boundaries in basename
-                                let bnBase = off + e.bnStart
+                                let basenameBase = allBase + off + e.bnStart
                                 var tokenBoundaryCount = 0
-                                var ti = 0
-                                while ti < tokens.count {
-                                    let token = tokens[ti]
-                                    let tLen = token.count
-                                    guard tLen <= bnLen else { ti &+= 1; continue }
-                                    var found = false
-                                    // Check prefix: basename starts with this token
-                                    var p = 0
-                                    var prefixOK = true
-                                    while p < tLen {
-                                        if allBase[bnBase + p] != token[p] { prefixOK = false; break }
-                                        p &+= 1
-                                    }
-                                    if prefixOK { found = true }
-                                    if !found {
-                                        // Check after each word boundary (space, dash, underscore, dot, slash)
-                                        var bi = 1
-                                        while bi + tLen <= bnLen {
-                                            let prev = allBase[bnBase + bi - 1]
-                                            if prev == 0x20 || prev == 0x2D || prev == 0x5F || prev == 0x2E || prev == 0x2F {
-                                                var ok = true; p = 0
-                                                while p < tLen {
-                                                    if allBase[bnBase + bi + p] != token[p] { ok = false; break }
-                                                    p &+= 1
+                                var tokenIndex = 0
+                                while tokenIndex < tokens.count {
+                                    let token = tokens[tokenIndex]
+                                    if token.count <= bnLen {
+                                        let found: Bool
+                                        if exhaustiveScoring {
+                                            var matched = false
+                                            var position = 0
+                                            while position + token.count <= bnLen {
+                                                if position == 0 {
+                                                    matched = token.withUnsafeBufferPointer {
+                                                        exactBytesMatch(
+                                                            $0,
+                                                            basenameBase: basenameBase,
+                                                            basenameLength: bnLen,
+                                                            at: position
+                                                        )
+                                                    }
+                                                } else {
+                                                    let previous = basenameBase[position - 1]
+                                                    if previous == 0x20 || previous == 0x2D || previous == 0x5F
+                                                        || previous == 0x2E || previous == 0x2F
+                                                    {
+                                                        matched = token.withUnsafeBufferPointer {
+                                                            exactBytesMatch(
+                                                                $0,
+                                                                basenameBase: basenameBase,
+                                                                basenameLength: bnLen,
+                                                                at: position
+                                                            )
+                                                        }
+                                                    }
                                                 }
-                                                if ok { found = true; break }
+                                                if matched { break }
+                                                position &+= 1
                                             }
-                                            bi &+= 1
+                                            found = matched
+                                        } else {
+                                            found = token.withUnsafeBufferPointer {
+                                                exactBytesMatch(
+                                                    $0,
+                                                    basenameBase: basenameBase,
+                                                    basenameLength: bnLen,
+                                                    at: 0
+                                                ) || hasDelimiterBoundaryMatch(
+                                                    $0,
+                                                    basenameBase: basenameBase,
+                                                    basenameLength: bnLen,
+                                                    boundaries: basenameBoundaries
+                                                )
+                                            }
                                         }
+                                        if found { tokenBoundaryCount &+= 1 }
                                     }
-                                    if found { tokenBoundaryCount &+= 1 }
-                                    ti &+= 1
+                                    tokenIndex &+= 1
                                 }
                                 if tokenBoundaryCount == tokens.count || extOK {
                                     sPrefixMatch = 2
@@ -2860,42 +3033,48 @@ final class SearchEngine: @unchecked Sendable {
                                 }
                                 segMatches = max(segMatches, tokenBoundaryCount)
                             } else if hasBase, baseBytes.count <= bnLen {
-                                let bnBase = off + e.bnStart
-                                // Check prefix: basename starts with query
-                                var prefixOK = true
-                                var p = 0
-                                while p < baseBytes.count {
-                                    if allBase[bnBase + p] != baseBytes[p] { prefixOK = false; break }
-                                    p &+= 1
-                                }
-                                if prefixOK || extOK {
+                                let basenameBase = allBase + off + e.bnStart
+                                let prefixMatch = baseBuf.count <= bnLen && exactBytesMatch(
+                                    baseBuf,
+                                    basenameBase: basenameBase,
+                                    basenameLength: bnLen,
+                                    at: 0
+                                )
+                                if prefixMatch || extOK {
                                     sPrefixMatch = 2
-                                } else {
-                                    // Check word-boundary: query matches right after a delimiter (- _ . /) in basename
+                                } else if exhaustiveScoring {
                                     var boundaryMatch = false
-                                    var bi = 1
-                                    while bi + baseBytes.count <= bnLen {
-                                        let prev = allBase[bnBase + bi - 1]
-                                        if prev == 0x2D || prev == 0x5F || prev == 0x2E || prev == 0x2F || prev == 0x20 {
-                                            var ok = true; p = 0
-                                            while p < baseBytes.count {
-                                                if allBase[bnBase + bi + p] != baseBytes[p] { ok = false; break }
-                                                p &+= 1
-                                            }
-                                            if ok { boundaryMatch = true; break }
+                                    var position = 1
+                                    while position + baseBuf.count <= bnLen {
+                                        let previous = basenameBase[position - 1]
+                                        if previous == 0x2D || previous == 0x5F || previous == 0x2E
+                                            || previous == 0x2F || previous == 0x20,
+                                           exactBytesMatch(
+                                               baseBuf,
+                                               basenameBase: basenameBase,
+                                               basenameLength: bnLen,
+                                               at: position
+                                           )
+                                        {
+                                            boundaryMatch = true
+                                            break
                                         }
-                                        bi &+= 1
+                                        position &+= 1
                                     }
                                     sPrefixMatch = boundaryMatch ? 1 : 0
+                                } else {
+                                    sPrefixMatch = hasDelimiterBoundaryMatch(
+                                        baseBuf,
+                                        basenameBase: basenameBase,
+                                        basenameLength: bnLen,
+                                        boundaries: basenameBoundaries
+                                    ) ? 1 : 0
                                 }
                             } else {
                                 sPrefixMatch = extOK ? 2 : 0
                             }
 
                             let tight = hasBase ? baseWindow : pathWindow
-                            // Penalize unmatched basename bytes so tight matches in short
-                            // basenames (e.g. "mkfl" → "Makefile") beat sparse matches in
-                            // long camelCase basenames (e.g. "...MaskForLocal...").
                             let basenameWaste = hasBase ? max(0, bnLen - baseWindow) : 0
                             let adjBaseScore = baseScore &- basenameWaste &* SC.basenameWastePenalty
                             let sTight = Int32(-tight)
@@ -2904,19 +3083,13 @@ final class SearchEngine: @unchecked Sendable {
                             let sDir = Int32(wantDir ? (e.isDir ? 100 : -100) : 0)
                             let sDepth = Int32(-e.segCount)
                             let sShorter = Int32(-e.pathLen)
-
-                            // When hasBase, pathScore for a non-slash query usually matches the
-                            // same characters in the basename, so taking max() with raw pathScore
-                            // would discard the waste penalty. Prefer adjBaseScore in that case.
                             let best = hasBase ? adjBaseScore : (hasPath ? pathScore : 0)
-                            let queryLen = !qBytes.isEmpty ? qBytes.count : dirSegments.reduce(0) { $0 + $1.count }
                             let qual: Int = if hasBase {
                                 adjBaseScore * baseBytes.count / max(baseWindow, 1)
                             } else if tokenBytes != nil {
-                                // Multi-token: use score directly since window spans across segments
                                 pathScore
                             } else {
-                                pathScore * queryLen / max(pathWindow, 1)
+                                pathScore * effectiveQueryLength / max(pathWindow, 1)
                             }
 
                             let key = SortKey(
@@ -2930,7 +3103,7 @@ final class SearchEngine: @unchecked Sendable {
                                 h: sDepth,
                                 i: sShorter
                             )
-                            local.append(ScoredEntry(
+                            collector.insert(ScoredEntry(
                                 id: id,
                                 key: key,
                                 bestScore: best,
@@ -2940,60 +3113,80 @@ final class SearchEngine: @unchecked Sendable {
                             ))
                             idx &+= 1
                         }
-                        chunkStore[chunk] = local
+                        chunkStore[chunk] = collector
                     }
                 }
             }
         }
         let scoreMs = (CFAbsoluteTimeGetCurrent() - t2) * 1000
-        var scored = [ScoredEntry]()
-        var totalScored = 0
-        for i in 0 ..< nChunks {
-            totalScored &+= chunkStore[i].count
-        }
-        scored.reserveCapacity(min(totalScored, maxResults * 4))
-        for i in 0 ..< nChunks {
-            scored.append(contentsOf: chunkStore[i])
-        }
-
         if isCancelled() { return [] }
 
         let t3 = CFAbsoluteTimeGetCurrent()
-        scored.sort { $0.key < $1.key }
-        let sortMs = (CFAbsoluteTimeGetCurrent() - t3) * 1000
+        let scored: [ScoredEntry]
+        if exhaustiveScoring {
+            var allScored: [ScoredEntry] = []
+            var totalScored = 0
+            for index in 0 ..< nChunks {
+                totalScored &+= chunkStore[index].results.count
+            }
+            allScored.reserveCapacity(totalScored)
+            for index in 0 ..< nChunks {
+                allScored.append(contentsOf: chunkStore[index].results)
+            }
+            allScored.sort(by: scoredEntryComesBefore)
+            if let first = allScored.first {
+                let minQuality = max(first.quality * 4 / 10, qBytes.count * scoreMatch / 2)
+                let filtered = allScored.filter { $0.quality >= minQuality || $0.hasBase }
+                if !filtered.isEmpty {
+                    allScored = filtered
+                }
+            }
+            scored = Array(allScored.prefix(scoreLimit))
+        } else {
+            var bestEntry: ScoredEntry?
+            for chunk in 0 ..< nChunks {
+                for entry in chunkStore[chunk].results {
+                    if bestEntry == nil || scoredEntryComesBefore(entry, bestEntry!) {
+                        bestEntry = entry
+                    }
+                }
+            }
 
-        if !scored.isEmpty {
-            let topQ = scored[0].quality
-            let minQ = max(topQ * 4 / 10, qBytes.count * scoreMatch / 2)
-            // Basename matches are exempt from the density floor (like FuzzyClient.mergeResults):
-            // an NFC-stored CJK basename match scores on the smaller NFC byte scale and would
-            // otherwise be dropped whenever NFD-stored path matches set a high topQ.
-            let filtered = scored.filter { $0.quality >= minQ || $0.hasBase }
-            // If the strict density-based floor kills every match (typical for
-            // a dense single-token query like "prvskyl" that legitimately spans
-            // multiple path segments — quality = pathScore * qLen / window
-            // collapses with wide windows), fall back to the unfiltered set so
-            // the user sees low-density matches instead of zero results.
-            if !filtered.isEmpty {
-                scored = filtered
+            if let bestEntry {
+                let minQuality = max(bestEntry.quality * 4 / 10, qBytes.count * scoreMatch / 2)
+                var hasQualified = false
+                for chunk in 0 ..< nChunks where !hasQualified {
+                    hasQualified = chunkStore[chunk].results.contains {
+                        $0.quality >= minQuality || $0.hasBase
+                    }
+                }
+
+                var collector = BoundedScoredCollector(
+                    limit: scoreLimit,
+                    estimatedCount: scoreLimit
+                )
+                for chunk in 0 ..< nChunks {
+                    for entry in chunkStore[chunk].results {
+                        if !hasQualified || entry.quality >= minQuality || entry.hasBase {
+                            collector.insert(entry)
+                        }
+                    }
+                }
+                scored = collector.results.sorted(by: scoredEntryComesBefore)
+            } else {
+                scored = []
             }
         }
+        let sortMs = (CFAbsoluteTimeGetCurrent() - t3) * 1000
 
-        // Keep a wider pool (4x maxResults) then sort by rank to ensure high-scoring
-        // path matches aren't eclipsed by lower-scoring basename matches
-        let pool = scored.prefix(maxResults * 4)
-        var results = pool.map { s in
+        let finalScored = scored.sorted(by: finalScoredEntryComesBefore).prefix(max(maxResults, 0))
+        let results = finalScored.map { s in
             let e = entries[s.id]
             return SearchResult(path: e.path, isDir: e.isDir, score: s.bestScore, quality: s.quality, hasBase: s.hasBase, segmentMatches: s.segmentMatches, pathImportance: Int(s.key.c), prefixMatch: s.key.b > 0, depth: e.segCount)
         }
-        results.sort { $0 > $1 }
-        results = Array(results.prefix(maxResults))
 
         let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-        slog
-            .debug(
-                "search: q=\"\(query)\" \(n) entries, \(cands.count) cands, \(scored.count) scored, \(results.count) results in \(totalMs, format: .fixed(precision: 1))ms (filter=\(filterMs, format: .fixed(precision: 1))ms score=\(scoreMs, format: .fixed(precision: 1))ms sort=\(sortMs, format: .fixed(precision: 1))ms)"
-            )
+        slog.debug("search: q=\"\(query)\" \(n) entries, \(cands.count) cands, \(scored.count) pooled, \(results.count) results in \(totalMs, format: .fixed(precision: 1))ms (filter=\(filterMs, format: .fixed(precision: 1))ms score=\(scoreMs, format: .fixed(precision: 1))ms merge=\(sortMs, format: .fixed(precision: 1))ms)")
         return results
     }
 
@@ -3028,6 +3221,82 @@ final class SearchEngine: @unchecked Sendable {
         }
     }
 
+    private struct ExtensionScoredEntry {
+        let id: Int
+        let importance: Int32
+        let depth: Int
+        let byteLength: Int
+    }
+
+    @inline(__always) private func extensionEntryComesBefore(
+        _ left: ExtensionScoredEntry,
+        _ right: ExtensionScoredEntry
+    ) -> Bool {
+        if left.importance != right.importance { return left.importance > right.importance }
+        if left.depth != right.depth { return left.depth < right.depth }
+        if left.byteLength != right.byteLength { return left.byteLength < right.byteLength }
+        return left.id < right.id
+    }
+
+    private struct BoundedExtensionCollector {
+        let limit: Int
+        private(set) var results: [ExtensionScoredEntry]
+
+        init(limit: Int, estimatedCount: Int = 0) {
+            self.limit = limit
+            results = []
+            results.reserveCapacity(min(limit, max(estimatedCount, 0)))
+        }
+
+        mutating func insert(_ entry: ExtensionScoredEntry) {
+            guard limit > 0 else { return }
+            if results.count < limit {
+                results.append(entry)
+                siftUp(from: results.count - 1)
+            } else if comesBefore(entry, results[0]) {
+                results[0] = entry
+                siftDown(from: 0)
+            }
+        }
+
+        private func comesBefore(_ left: ExtensionScoredEntry, _ right: ExtensionScoredEntry) -> Bool {
+            if left.importance != right.importance { return left.importance > right.importance }
+            if left.depth != right.depth { return left.depth < right.depth }
+            if left.byteLength != right.byteLength { return left.byteLength < right.byteLength }
+            return left.id < right.id
+        }
+
+        private func isWorse(_ left: ExtensionScoredEntry, than right: ExtensionScoredEntry) -> Bool {
+            comesBefore(right, left)
+        }
+
+        private mutating func siftUp(from index: Int) {
+            var child = index
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard isWorse(results[child], than: results[parent]) else { return }
+                results.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        private mutating func siftDown(from index: Int) {
+            var parent = index
+            while true {
+                let left = parent * 2 + 1
+                guard left < results.count else { return }
+                let right = left + 1
+                var worseChild = left
+                if right < results.count, isWorse(results[right], than: results[left]) {
+                    worseChild = right
+                }
+                guard isWorse(results[worseChild], than: results[parent]) else { return }
+                results.swapAt(parent, worseChild)
+                parent = worseChild
+            }
+        }
+    }
+
     private struct ScoredEntry {
         let id: Int
         let key: SortKey
@@ -3035,6 +3304,110 @@ final class SearchEngine: @unchecked Sendable {
         let quality: Int
         let hasBase: Bool
         var segmentMatches = 0
+    }
+
+    @inline(__always) private func scoredEntryComesBefore(_ left: ScoredEntry, _ right: ScoredEntry) -> Bool {
+        if left.key != right.key { return left.key < right.key }
+        return left.id < right.id
+    }
+
+    @inline(__always) private func finalRank(_ entry: ScoredEntry, pathCharacterCount: Int) -> Int {
+        var rank = max(entry.bestScore, entry.quality)
+        if entry.hasBase { rank += SC.rankHasBaseBonus }
+        rank += entry.segmentMatches * SC.rankHasBaseBonus
+        if entry.key.b > 0 { rank += SC.rankPrefixMatchBonus }
+        rank += Int(entry.key.c) * SC.rankImportanceMultiplier
+        rank -= max(0, pathCharacterCount - SC.rankLongPathThreshold)
+        return rank
+    }
+
+    private func finalScoredEntryComesBefore(_ left: ScoredEntry, _ right: ScoredEntry) -> Bool {
+        let leftEntry = entries[left.id]
+        let rightEntry = entries[right.id]
+        let leftPathCount = leftEntry.path.count
+        let rightPathCount = rightEntry.path.count
+        let leftRank = finalRank(left, pathCharacterCount: leftPathCount)
+        let rightRank = finalRank(right, pathCharacterCount: rightPathCount)
+        if leftRank != rightRank { return leftRank > rightRank }
+        if left.bestScore != right.bestScore { return left.bestScore > right.bestScore }
+        if leftEntry.segCount != rightEntry.segCount { return leftEntry.segCount < rightEntry.segCount }
+        if leftPathCount != rightPathCount { return leftPathCount < rightPathCount }
+        return leftEntry.path < rightEntry.path
+    }
+
+    private struct BoundedScoredCollector {
+        let limit: Int
+        private(set) var results: [ScoredEntry]
+
+        init(limit: Int, estimatedCount: Int = 0) {
+            self.limit = limit
+            results = []
+            results.reserveCapacity(min(limit, max(estimatedCount, 0)))
+        }
+
+        mutating func insert(_ entry: ScoredEntry) {
+            guard limit > 0 else { return }
+            if results.count < limit {
+                results.append(entry)
+                siftUp(from: results.count - 1)
+            } else if comesBefore(entry, results[0]) {
+                results[0] = entry
+                siftDown(from: 0)
+            }
+        }
+
+        private func comesBefore(_ left: ScoredEntry, _ right: ScoredEntry) -> Bool {
+            if left.key != right.key { return left.key < right.key }
+            return left.id < right.id
+        }
+
+        private func isWorse(_ left: ScoredEntry, than right: ScoredEntry) -> Bool {
+            comesBefore(right, left)
+        }
+
+        private mutating func siftUp(from index: Int) {
+            var child = index
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard isWorse(results[child], than: results[parent]) else { return }
+                results.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        private mutating func siftDown(from index: Int) {
+            var parent = index
+            while true {
+                let left = parent * 2 + 1
+                guard left < results.count else { return }
+                let right = left + 1
+                var worseChild = left
+                if right < results.count, isWorse(results[right], than: results[left]) {
+                    worseChild = right
+                }
+                guard isWorse(results[worseChild], than: results[parent]) else { return }
+                results.swapAt(parent, worseChild)
+                parent = worseChild
+            }
+        }
+    }
+
+    private func searchWorkerCount(
+        candidateCount: Int,
+        queryLength: Int,
+        hasOperators: Bool,
+        hasFolderPrefixes: Bool,
+        hasDirSegments: Bool
+    ) -> Int {
+        let cpu = max(ProcessInfo.processInfo.activeProcessorCount, 1)
+        guard candidateCount > 0 else { return 1 }
+        if candidateCount < 2_000 { return 1 }
+        if queryLength <= 2 { return min(cpu, 2) }
+        if queryLength <= 4, !hasOperators, !hasFolderPrefixes, !hasDirSegments {
+            return min(cpu, 2)
+        }
+        if candidateCount < 20_000 { return min(cpu, 3) }
+        return min(cpu, 4)
     }
 
     /// Per-entry bytes in the fixed-size section: masks + bnMasks + bnBoundaries (8 each), byteOffsets (4),
@@ -3072,6 +3445,9 @@ final class SearchEngine: @unchecked Sendable {
     private var byteLengths: [Int] = []
 
     private var extIDs: [UInt16] = [] // Extension ID per entry (0 = no extension)
+    // Low 3 bits: static location tier (1...4). High bit: path contains a hidden segment.
+    private var pathMetadata: [UInt8] = []
+    private static let hiddenPathMetadataBit: UInt8 = 0x80
 
     private var free: [Int] = []
     private var pathToID: [String: Int] = [:]
@@ -3156,6 +3532,65 @@ final class SearchEngine: @unchecked Sendable {
             if starts { lo = mid &+ 1 } else { hi = mid }
         }
         return lo
+    }
+
+    @inline(__always) private func pathMetadataByte(
+        _ base: UnsafePointer<UInt8>, off: Int, len: Int, bnStart: Int
+    ) -> UInt8 {
+        var hidden = bnStart < len && base[off + bnStart] == 0x2E
+        if !hidden {
+            var p = 0
+            while p + 1 < len {
+                if base[off + p] == 0x2F, base[off + p + 1] == 0x2E {
+                    hidden = true
+                    break
+                }
+                p &+= 1
+            }
+        }
+
+        var tier: UInt8 = 1
+        var prefixIndex = 0
+        while prefixIndex < importancePrefixes.count {
+            let prefix = importancePrefixes[prefixIndex]
+            if len >= prefix.count, memcmp(base + off, prefix, prefix.count) == 0 {
+                tier = 4
+                break
+            }
+            prefixIndex &+= 1
+        }
+        if tier != 4, len >= importanceHomePrefix.count,
+           memcmp(base + off, importanceHomePrefix, importanceHomePrefix.count) == 0
+        {
+            if len >= importanceLibraryPrefix.count,
+               memcmp(base + off, importanceLibraryPrefix, importanceLibraryPrefix.count) == 0
+            {
+                tier = 2
+            } else {
+                tier = 3
+            }
+        }
+        return tier | (hidden ? Self.hiddenPathMetadataBit : 0)
+    }
+
+    private func rebuildPathMetadata() {
+        let n = entries.count
+        pathMetadata = [UInt8](repeating: 0, count: n)
+        allBytes.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var i = 0
+            while i < n {
+                if byteLengths[i] > 0 {
+                    pathMetadata[i] = pathMetadataByte(
+                        base,
+                        off: byteOffsets[i],
+                        len: byteLengths[i],
+                        bnStart: entries[i].bnStart
+                    )
+                }
+                i &+= 1
+            }
+        }
     }
 
     /// Compute extIDs for all entries that don't have one yet (after binary index load)
@@ -3266,8 +3701,12 @@ final class SearchEngine: @unchecked Sendable {
         }
 
         // Compute extension ID from the lowercased bytes in allBytes
-        let eid = allBytes.withUnsafeBufferPointer { buf in
-            extID(for: buf.baseAddress! + byteOff, len: pathLen, bnStart: bnStart)
+        let (eid, metadata) = allBytes.withUnsafeBufferPointer { buf in
+            let base = buf.baseAddress!
+            return (
+                extID(for: base + byteOff, len: pathLen, bnStart: bnStart),
+                pathMetadataByte(base, off: byteOff, len: pathLen, bnStart: bnStart)
+            )
         }
 
         let entry = Entry(
@@ -3287,6 +3726,7 @@ final class SearchEngine: @unchecked Sendable {
             byteOffsets[id] = byteOff
             byteLengths[id] = pathLen
             extIDs[id] = eid
+            pathMetadata[id] = metadata
         } else {
             id = entries.count
             entries.append(entry)
@@ -3296,6 +3736,7 @@ final class SearchEngine: @unchecked Sendable {
             byteOffsets.append(byteOff)
             byteLengths.append(pathLen)
             extIDs.append(eid)
+            pathMetadata.append(metadata)
         }
         pathToID[path] = id
         return id
@@ -3311,6 +3752,7 @@ final class SearchEngine: @unchecked Sendable {
         byteOffsets[id] = 0
         byteLengths[id] = 0
         extIDs[id] = 0
+        pathMetadata[id] = 0
         free.append(id)
         return true
     }
@@ -3353,10 +3795,15 @@ final class SearchEngine: @unchecked Sendable {
         bnMasks.append(bnMaskAccum)
         byteOffsets.append(byteOff)
         byteLengths.append(pathLen)
-        let eid = allBytes.withUnsafeBufferPointer { buf in
-            extID(for: buf.baseAddress! + byteOff, len: pathLen, bnStart: bnStart)
+        let (eid, metadata) = allBytes.withUnsafeBufferPointer { buf in
+            let base = buf.baseAddress!
+            return (
+                extID(for: base + byteOff, len: pathLen, bnStart: bnStart),
+                pathMetadataByte(base, off: byteOff, len: pathLen, bnStart: bnStart)
+            )
         }
         extIDs.append(eid)
+        pathMetadata.append(metadata)
     }
 
 }

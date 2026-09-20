@@ -431,7 +431,7 @@ do {
         || parsedQuery.scope == .filesOnly
     let candidateLimit: Int
     if let limit = options.limit, !requiresCompleteCandidateWindow {
-        candidateLimit = min(10_000, max(limit, min(limit, 2_000) * 5))
+        candidateLimit = min(5_000, max(limit, limit * 3))
     } else {
         candidateLimit = 10_000
     }
@@ -460,24 +460,38 @@ do {
     }
 
     let evaluator = ResultEvaluator(query: parsedQuery, caseSensitive: options.caseSensitive)
-    var collector = BoundedResultCollector(
-        limit: options.limit,
-        sortBy: options.sortBy,
-        sortOrder: options.sortOrder
-    )
-    for entry in response.results {
-        if let result = evaluator.result(for: entry) {
-            collector.insert(result)
+    if options.sortBy == .relevance {
+        var results: [SearchResult] = []
+        results.reserveCapacity(options.limit ?? response.results.count)
+        for entry in response.results {
+            if let result = evaluator.result(for: entry) {
+                results.append(result)
+                if let limit = options.limit, results.count >= limit {
+                    break
+                }
+            }
         }
-    }
+        try printAlfred(results)
+    } else {
+        var collector = BoundedResultCollector(
+            limit: options.limit,
+            sortBy: options.sortBy,
+            sortOrder: options.sortOrder
+        )
+        for entry in response.results {
+            if let result = evaluator.result(for: entry) {
+                collector.insert(result)
+            }
+        }
 
-    var results = collector.results.sorted {
-        resultComesBefore($0, $1, by: options.sortBy, order: options.sortOrder)
+        var results = collector.results.sorted {
+            resultComesBefore($0, $1, by: options.sortBy, order: options.sortOrder)
+        }
+        if let limit = options.limit {
+            results = Array(results.prefix(limit))
+        }
+        try printAlfred(results)
     }
-    if let limit = options.limit {
-        results = Array(results.prefix(limit))
-    }
-    try printAlfred(results)
 } catch {
     FileHandle.standardError.write(Data("better-find workflow adapter: \(error)\n".utf8))
     exit(1)
