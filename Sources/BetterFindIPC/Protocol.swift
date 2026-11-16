@@ -1,7 +1,7 @@
 import Foundation
 
 public let betterFindProtocolVersion = 1
-public let betterFindBackendImplementationVersion = "betterfind-cling-e307f37-9"
+public let betterFindBackendImplementationVersion = "betterfind-cling-e307f37-11"
 
 public enum BackendCommand: String, Codable, Sendable {
     case search
@@ -57,6 +57,12 @@ public struct BackendRequest: Codable, Sendable {
     public let maxResults: Int?
     public let directoriesOnly: Bool?
     public let literalDefault: Bool?
+    /// When set, the backend applies the adapter's name/scope verification before replying,
+    /// so discarded candidates never cross the socket.
+    public let resultScope: QueryScope?
+    public let caseSensitive: Bool?
+    /// Maximum number of verified results to return; nil returns every verified candidate.
+    public let verifiedLimit: Int?
 
     public init(
         command: BackendCommand,
@@ -65,8 +71,14 @@ public struct BackendRequest: Codable, Sendable {
         maxResults: Int? = nil,
         directoriesOnly: Bool? = nil,
         literalDefault: Bool? = nil,
+        resultScope: QueryScope? = nil,
+        caseSensitive: Bool? = nil,
+        verifiedLimit: Int? = nil,
         protocolVersion: Int = betterFindProtocolVersion
     ) {
+        self.resultScope = resultScope
+        self.caseSensitive = caseSensitive
+        self.verifiedLimit = verifiedLimit
         self.protocolVersion = protocolVersion
         self.command = command
         self.configuration = configuration

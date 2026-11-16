@@ -58,17 +58,6 @@ else
     args+=(--include-system)
 fi
 
-output="$("${args[@]}" -- "$query" 2>/dev/null)"
-exit_status=$?
-
-if (( exit_status != 0 )); then
-    print -rn -- '{"items":[{"title":"Better Find could not complete the search","subtitle":"Review the Better Find workflow configuration in Alfred","valid":false}]}'
-    exit 0
-fi
-
-if [[ "$output" == '{"items":[]}' ]]; then
-    print -rn -- '{"items":[{"title":"No matching files or folders","subtitle":"Try another search term or review the workflow settings","valid":false}]}'
-    exit 0
-fi
-
-print -rn -- "$output"
+# The adapter emits its own "no matches" and error items, so replace this shell
+# with it rather than buffering its output in a subshell.
+exec "${args[@]}" -- "$query" 2>/dev/null

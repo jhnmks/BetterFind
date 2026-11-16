@@ -1,6 +1,35 @@
 import ClingSearchCore
 import Foundation
 
+
+// `better-find-benchmark backend <root> <index-file> [fingerprint-output]` times the
+// backend's build, save, load, and live-update stages against a real directory tree.
+if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "backend" {
+    let report = BackendBenchmark.run(
+        root: CommandLine.arguments[2],
+        indexURL: URL(fileURLWithPath: CommandLine.arguments[3]),
+        queries: ["a", "annual", "annual report", "apple", "fin dra", "rdme", "sw", "budget", "cafe", "meeting"]
+    )
+    print(String(
+        format: "entries=%d build=%.1fms save=%.1fms index=%.2fMB load=%.1fms resident=%.1fMB add2000=%.1fms removeFolder=%.1fms singleChange=%.3fms churnIndex=%.2fMB",
+        report.entries,
+        report.buildMilliseconds,
+        report.saveMilliseconds,
+        Double(report.indexBytes) / 1_048_576,
+        report.loadMilliseconds,
+        Double(report.residentBytesAfterLoad) / 1_048_576,
+        report.addMilliseconds,
+        report.removeFolderMilliseconds,
+        report.singleChangeMilliseconds,
+        Double(report.churnSaveBytes) / 1_048_576
+    ))
+    if CommandLine.arguments.count >= 5 {
+        try? report.resultFingerprint.joined(separator: "\n")
+            .write(toFile: CommandLine.arguments[4], atomically: true, encoding: .utf8)
+    }
+    exit(0)
+}
+
 func positiveInteger(at index: Int, default defaultValue: Int) -> Int {
     guard CommandLine.arguments.count > index else { return defaultValue }
     guard let value = Int(CommandLine.arguments[index]), value >= 0 else {

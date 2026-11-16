@@ -203,45 +203,21 @@ private func makeBackendConfiguration(
     )
 }
 
-private struct ResultEvaluator {
-    let matcher: PreparedNameMatcher
-    let scope: QueryScope
-
-    init(query: ParsedSearchQuery, caseSensitive: Bool) {
-        matcher = PreparedNameMatcher(
-            mode: query.mode,
-            query: query.text,
-            caseSensitive: caseSensitive
-        )
-        scope = query.scope
-    }
-
-    func result(for entry: BackendSearchResult) -> SearchResult? {
-        let url = URL(fileURLWithPath: entry.path)
-        let name = url.lastPathComponent
-        guard matcher.matches(name) else { return nil }
-
-        switch scope {
-        case .filesAndFolders:
-            break
-        case .filesOnly where entry.isDirectory:
-            return nil
-        case .foldersOnly where !entry.isDirectory:
-            return nil
-        default:
-            break
-        }
-
-        return SearchResult(
-            name: name,
-            path: entry.path,
-            isDirectory: entry.isDirectory,
-            relevance: entry.rank,
-            nameLength: name.count,
-            depth: entry.path.reduce(into: 0) { if $1 == "/" { $0 += 1 } },
-            typeSortKey: entry.isDirectory ? "folder" : url.pathExtension
-        )
-    }
+/// Builds display/sort records for results the backend has already verified against the
+/// query's name matcher and file/folder scope.
+private func makeResult(_ entry: BackendSearchResult, needsTypeKey: Bool) -> SearchResult {
+    let name = indexedName(of: entry.path)
+    return SearchResult(
+        name: name,
+        path: entry.path,
+        isDirectory: entry.isDirectory,
+        relevance: entry.rank,
+        nameLength: name.count,
+        depth: pathSlashCount(entry.path),
+        typeSortKey: entry.isDirectory
+            ? "folder"
+            : (needsTypeKey ? URL(fileURLWithPath: entry.path).pathExtension : "")
+    )
 }
 
 private func resultComesBefore(
@@ -334,6 +310,13 @@ private struct BoundedResultCollector {
 }
 
 private func printAlfred(_ results: [SearchResult]) throws {
+    guard !results.isEmpty else {
+        try printAlfredPrompt(
+            title: "No matching files or folders",
+            subtitle: "Try another search term or review the workflow settings"
+        )
+        return
+    }
     let items = results.map { result in
         AlfredItem(
             uid: result.path,
@@ -442,7 +425,12 @@ do {
         query: parsedQuery.text,
         maxResults: candidateLimit,
         directoriesOnly: parsedQuery.scope == .foldersOnly,
-        literalDefault: parsedQuery.mode == .contains
+        literalDefault: parsedQuery.mode == .contains,
+        resultScope: parsedQuery.scope,
+        caseSensitive: options.caseSensitive,
+        // Relevance keeps backend order, so only the first `limit` verified results matter.
+        // Other sorts must see every verified candidate before choosing the top `limit`.
+        verifiedLimit: options.sortBy == .relevance ? options.limit : nil
     ))
 
     switch response.state {
@@ -459,17 +447,11 @@ do {
         break
     }
 
-    let evaluator = ResultEvaluator(query: parsedQuery, caseSensitive: options.caseSensitive)
+    let needsTypeKey = options.sortBy == .type
     if options.sortBy == .relevance {
-        var results: [SearchResult] = []
-        results.reserveCapacity(options.limit ?? response.results.count)
-        for entry in response.results {
-            if let result = evaluator.result(for: entry) {
-                results.append(result)
-                if let limit = options.limit, results.count >= limit {
-                    break
-                }
-            }
+        var results = response.results.map { makeResult($0, needsTypeKey: false) }
+        if let limit = options.limit, results.count > limit {
+            results.removeSubrange(limit...)
         }
         try printAlfred(results)
     } else {
@@ -479,9 +461,7 @@ do {
             sortOrder: options.sortOrder
         )
         for entry in response.results {
-            if let result = evaluator.result(for: entry) {
-                collector.insert(result)
-            }
+            collector.insert(makeResult(entry, needsTypeKey: needsTypeKey))
         }
 
         var results = collector.results.sorted {
@@ -494,5 +474,9 @@ do {
     }
 } catch {
     FileHandle.standardError.write(Data("better-find workflow adapter: \(error)\n".utf8))
-    exit(1)
+    try? printAlfredPrompt(
+        title: "Better Find could not complete the search",
+        subtitle: "Review the Better Find workflow configuration in Alfred"
+    )
+    exit(0)
 }

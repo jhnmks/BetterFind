@@ -100,7 +100,7 @@ Changing the root, recursion, hidden-item, system-folder, or excluded-path setti
 - **Interactive latency:** the persistent backend avoids reopening and decoding the index for every keystroke.
 - **Filename discovery:** fuzzy scoring handles incomplete, abbreviated, and multi-word names well.
 - **macOS integration:** native file icons, Alfred actions, FSEvents, Finder, Quick Look, and a native terminal-app picker.
-- **Large roots:** compact binary storage, bitmask candidate filtering, SIMD byte scanning, parallel scoring, and bounded result collection.
+- **Large roots:** multi-threaded directory walking, compact binary storage, bitmask candidate filtering, SIMD byte scanning, parallel scoring, and bounded result collection.
 - **Freshness:** file changes are applied live; persisted FSEvent IDs allow changes to be replayed after the backend restarts.
 - **Privacy:** paths and queries stay on the Mac.
 
@@ -134,8 +134,8 @@ flowchart TD
 1. Alfred runs `search.zsh` with the current query and workflow settings.
 2. The short-lived `better-find` adapter parses prefixes and contacts `better-find-backend` over a permission-restricted Unix socket.
 3. The backend loads a compatible binary index or builds one asynchronously. Alfred displays loading, building, rebuilding, or recovery status and reruns automatically.
-4. Warm searches run against the already loaded engine.
-5. The adapter verifies result scope and matching semantics, applies the configured bounded sort, and emits Alfred Script Filter JSON.
+4. Warm searches run against the already loaded engine. The backend also verifies result scope and matching semantics, so only accepted results are sent back over the socket.
+5. The adapter applies the configured bounded sort and emits Alfred Script Filter JSON.
 6. FSEvents updates the live engine and schedules debounced snapshots to disk.
 
 The backend is started on demand. It does not install a LaunchAgent, app, system daemon, or separate user-facing CLI.
@@ -151,7 +151,7 @@ The backend is started on demand. It does not install a LaunchAgent, app, system
 
 ## Performance
 
-The hot path avoids process-heavy indexing work: the adapter performs IPC, query verification, bounded sorting, and JSON encoding while the long-lived backend owns the loaded index.
+The hot path avoids process-heavy indexing work: the long-lived backend owns the loaded index and verifies candidates, and the adapter performs IPC, bounded sorting, and JSON encoding.
 
 In a packaged synthetic benchmark with 30,000 matching files, earlier optimization work reduced a normal 100-result warm query from a 65 ms to 49 ms median, cold index readiness from 2.011 s to 1.364 s, and a deliberately heavy 1,000-result query from 450 ms to 142 ms on the same build Mac. These are comparative development measurements, not universal guarantees; root size, storage, permissions, query type, and Apple Silicon generation affect real performance.
 
@@ -163,6 +163,10 @@ swift run --build-system native -c release better-find-benchmark 250000
 
 # Add 60 generated stress queries and use a replayable corpus seed
 swift run --build-system native -c release better-find-benchmark 100000 60 1
+
+# Time the backend stages (walk/build, save, load, live updates) against a real folder.
+# Optionally write a ranked-result fingerprint to compare two builds.
+swift run --build-system native -c release better-find-benchmark backend ~/Documents /tmp/bf.idx /tmp/fingerprint.txt
 ```
 
 ## Privacy and permissions

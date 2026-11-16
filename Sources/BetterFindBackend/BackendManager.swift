@@ -270,22 +270,45 @@ final class BackendManager: @unchecked Sendable {
         }
 
         let started = CFAbsoluteTimeGetCurrent()
+        let query = request.query ?? ""
+        let literalDefault = request.literalDefault ?? false
         let results = engine.search(
-            query: request.query ?? "",
+            query: query,
             maxResults: request.maxResults ?? 100,
             directoriesOnly: request.directoriesOnly ?? false,
-            literalDefault: request.literalDefault ?? false
+            literalDefault: literalDefault
         )
+
+        var output: [BackendSearchResult] = []
+        if let scope = request.resultScope {
+            let filter = ResultFilter(
+                mode: literalDefault ? .contains : .smart,
+                text: query,
+                scope: scope,
+                caseSensitive: request.caseSensitive ?? false
+            )
+            let limit = request.verifiedLimit ?? Int.max
+            output.reserveCapacity(min(limit, results.count))
+            for result in results where output.count < limit {
+                guard filter.accepts(
+                    name: indexedName(of: result.path),
+                    isDirectory: result.isDirectory
+                ) else { continue }
+                output.append(BackendSearchResult(
+                    path: result.path,
+                    isDirectory: result.isDirectory,
+                    rank: result.rank
+                ))
+            }
+        } else {
+            output = results.map {
+                BackendSearchResult(path: $0.path, isDirectory: $0.isDirectory, rank: $0.rank)
+            }
+        }
         let elapsed = (CFAbsoluteTimeGetCurrent() - started) * 1_000
         return BackendResponse(
             state: .ready,
-            results: results.map {
-                BackendSearchResult(
-                    path: $0.path,
-                    isDirectory: $0.isDirectory,
-                    rank: $0.rank
-                )
-            },
+            results: output,
             message: snapshot.indexing ? "A refreshed index is being built in the background" : nil,
             indexCount: engine.count,
             searchMilliseconds: elapsed,

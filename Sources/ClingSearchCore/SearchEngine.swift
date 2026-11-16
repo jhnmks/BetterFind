@@ -592,6 +592,15 @@ final class SearchEngine: @unchecked Sendable {
     func saveBinaryIndex(to url: URL) {
         let t0 = CFAbsoluteTimeGetCurrent()
         lock.lock()
+        // Live updates free slots (empty entries) and orphan their bytes in allBytes. Persist a
+        // compacted copy so those never reach disk: live entries keep their relative order, so
+        // id-based tie-breaking ranks identically after reload.
+        if !free.isEmpty || allBytes.count > liveByteCount() {
+            let compacted = compactedCopy()
+            lock.unlock()
+            compacted.saveBinaryIndex(to: url)
+            return
+        }
         let n = entries.count
 
         // Compute total path string bytes
@@ -691,6 +700,53 @@ final class SearchEngine: @unchecked Sendable {
         try? data.write(to: url)
         let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
         slog.info("saveBinaryIndex: \(n) entries, \(totalSize / 1_048_576)MB in \(ms, format: .fixed(precision: 1))ms")
+    }
+
+    /// Bytes referenced by live entries. Caller must hold the lock.
+    private func liveByteCount() -> Int {
+        var total = 0
+        var i = 0
+        while i < byteLengths.count {
+            total &+= byteLengths[i]
+            i &+= 1
+        }
+        return total
+    }
+
+    /// A new engine holding only live entries, in their existing relative order, with tightly
+    /// packed path bytes. Caller must hold the lock.
+    private func compactedCopy() -> SearchEngine {
+        let copy = SearchEngine()
+        var live = 0
+        var i = 0
+        while i < entries.count {
+            if byteLengths[i] > 0 { live &+= 1 }
+            i &+= 1
+        }
+        copy.entries.reserveCapacity(live)
+        copy.masks.reserveCapacity(live)
+        copy.bnMasks.reserveCapacity(live)
+        copy.bnBoundaries.reserveCapacity(live)
+        copy.byteOffsets.reserveCapacity(live)
+        copy.byteLengths.reserveCapacity(live)
+        copy.allBytes.reserveCapacity(liveByteCount())
+        allBytes.withUnsafeBufferPointer { source in
+            i = 0
+            while i < entries.count {
+                let length = byteLengths[i]
+                if length > 0 {
+                    copy.byteOffsets.append(copy.allBytes.count)
+                    copy.allBytes.append(contentsOf: UnsafeBufferPointer(rebasing: source[byteOffsets[i] ..< byteOffsets[i] + length]))
+                    copy.byteLengths.append(length)
+                    copy.entries.append(entries[i])
+                    copy.masks.append(masks[i])
+                    copy.bnMasks.append(bnMasks[i])
+                    copy.bnBoundaries.append(bnBoundaries[i])
+                }
+                i &+= 1
+            }
+        }
+        return copy
     }
 
     func loadBinaryIndex(from url: URL, progress: ((Int) -> Void)? = nil) -> Bool {
@@ -1456,6 +1512,86 @@ final class SearchEngine: @unchecked Sendable {
         let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
         slog.info("walkDirectory: \(dir) added=\(added) skippedIgnore=\(skippedIgnore) in \(ms, format: .fixed(precision: 1))ms")
         return added
+    }
+
+    /// Same entries, in the same order, as `walkDirectory` with no ignore files or blocklist,
+    /// but reads directories on several threads. Falls back to the `fts` walk if the root
+    /// cannot be opened that way.
+    @discardableResult
+    func walkDirectoryParallel(
+        _ dir: String,
+        skipDir: ((String) -> Bool)? = nil,
+        includeFile: ((String) -> Bool)? = nil,
+        skipGitDirectories: Bool = true,
+        progress: ((Int, String) -> Void)? = nil,
+        cancelled: (() -> Bool)? = nil
+    ) -> Int {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let walker = ParallelDirectoryWalker(
+            skipDirectory: skipDir,
+            includeFile: includeFile,
+            skipGitDirectories: skipGitDirectories,
+            progress: progress,
+            cancelled: cancelled
+        )
+        guard let items = walker.walk(dir) else {
+            return walkDirectory(
+                dir,
+                skipDir: skipDir,
+                includeFile: includeFile,
+                skipGitDirectories: skipGitDirectories,
+                progress: progress,
+                cancelled: cancelled
+            )
+        }
+        if cancelled?() == true { return 0 }
+
+        // Insert in walk order. Batches keep each lock hold short when a live engine is being
+        // searched concurrently (FSEvents directory additions).
+        // A walk never yields the same path twice, so filling an empty engine can skip the
+        // per-path dictionary; `pathToID` is then built lazily in one pass on first lookup.
+        let fresh = lock.withLock { entries.isEmpty && !pathIndexBuilt }
+        let batchSize = 4_096
+        var start = 0
+        while start < items.count {
+            let end = min(start + batchSize, items.count)
+            lock.lock()
+            if start == 0 { reserveUnlocked(additional: items.count, includePathIndex: !fresh) }
+            var index = start
+            while index < end {
+                if fresh {
+                    _ = _appendPath(items[index].0, isDir: items[index].1)
+                } else {
+                    _ = _addPath(items[index].0, isDir: items[index].1)
+                }
+                index &+= 1
+            }
+            lock.unlock()
+            start = end
+        }
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        slog.info("walkDirectoryParallel: \(dir) added=\(items.count) in \(ms, format: .fixed(precision: 1))ms")
+        return items.count
+    }
+
+    /// Caller must hold the lock.
+    private func reserveUnlocked(additional: Int, includePathIndex: Bool) {
+        let n = entries.count + additional
+        entries.reserveCapacity(n)
+        masks.reserveCapacity(n)
+        bnMasks.reserveCapacity(n)
+        bnBoundaries.reserveCapacity(n)
+        byteOffsets.reserveCapacity(n)
+        byteLengths.reserveCapacity(n)
+        extIDs.reserveCapacity(n)
+        pathMetadata.reserveCapacity(n)
+        if includePathIndex { pathToID.reserveCapacity(pathToID.count + additional) }
+    }
+
+    /// Builds the path lookup table now (if needed) so the first live filesystem change
+    /// does not pay for it while holding the lock a search needs.
+    func preparePathIndex() {
+        lock.withLock { ensurePathIndex() }
     }
 
     /// Walk using FileManager for network/external volumes (batches directory reads, better for high-latency storage)
@@ -3179,7 +3315,7 @@ final class SearchEngine: @unchecked Sendable {
         }
         let sortMs = (CFAbsoluteTimeGetCurrent() - t3) * 1000
 
-        let finalScored = scored.sorted(by: finalScoredEntryComesBefore).prefix(max(maxResults, 0))
+        let finalScored = finalOrder(scored, limit: max(maxResults, 0))
         let results = finalScored.map { s in
             let e = entries[s.id]
             return SearchResult(path: e.path, isDir: e.isDir, score: s.bestScore, quality: s.quality, hasBase: s.hasBase, segmentMatches: s.segmentMatches, pathImportance: Int(s.key.c), prefixMatch: s.key.b > 0, depth: e.segCount)
@@ -3321,18 +3457,38 @@ final class SearchEngine: @unchecked Sendable {
         return rank
     }
 
-    private func finalScoredEntryComesBefore(_ left: ScoredEntry, _ right: ScoredEntry) -> Bool {
-        let leftEntry = entries[left.id]
-        let rightEntry = entries[right.id]
-        let leftPathCount = leftEntry.path.count
-        let rightPathCount = rightEntry.path.count
-        let leftRank = finalRank(left, pathCharacterCount: leftPathCount)
-        let rightRank = finalRank(right, pathCharacterCount: rightPathCount)
-        if leftRank != rightRank { return leftRank > rightRank }
-        if left.bestScore != right.bestScore { return left.bestScore > right.bestScore }
-        if leftEntry.segCount != rightEntry.segCount { return leftEntry.segCount < rightEntry.segCount }
-        if leftPathCount != rightPathCount { return leftPathCount < rightPathCount }
-        return leftEntry.path < rightEntry.path
+    /// Final ordering: rank, best score, shallower, shorter, then path. Each entry's rank and
+    /// Character count are computed once up front rather than inside every comparison;
+    /// `String.count` walks grapheme clusters, so recomputing it O(n log n) times dominated
+    /// large candidate pools.
+    private func finalOrder(_ scored: [ScoredEntry], limit: Int) -> ArraySlice<ScoredEntry> {
+        struct Keyed {
+            let rank: Int
+            let bestScore: Int
+            let segCount: Int
+            let pathCount: Int
+            let index: Int
+        }
+        var keyed: [Keyed] = []
+        keyed.reserveCapacity(scored.count)
+        for (index, entry) in scored.enumerated() {
+            let pathCount = entries[entry.id].path.count
+            keyed.append(Keyed(
+                rank: finalRank(entry, pathCharacterCount: pathCount),
+                bestScore: entry.bestScore,
+                segCount: entries[entry.id].segCount,
+                pathCount: pathCount,
+                index: index
+            ))
+        }
+        keyed.sort { left, right in
+            if left.rank != right.rank { return left.rank > right.rank }
+            if left.bestScore != right.bestScore { return left.bestScore > right.bestScore }
+            if left.segCount != right.segCount { return left.segCount < right.segCount }
+            if left.pathCount != right.pathCount { return left.pathCount < right.pathCount }
+            return entries[scored[left.index].id].path < entries[scored[right.index].id].path
+        }
+        return keyed.prefix(limit).map { scored[$0.index] }[...]
     }
 
     private struct BoundedScoredCollector {
@@ -3649,6 +3805,14 @@ final class SearchEngine: @unchecked Sendable {
     private func _addPath(_ path: String, isDir: Bool) -> Int {
         ensurePathIndex()
         if let existing = pathToID[path] { return existing }
+        let id = _appendPath(path, isDir: isDir)
+        pathToID[path] = id
+        return id
+    }
+
+    /// Stores a path known not to be indexed yet, without touching `pathToID`.
+    /// Caller must hold the lock and keep `pathToID` consistent (or leave it unbuilt).
+    private func _appendPath(_ path: String, isDir: Bool) -> Int {
 
         let byteOff = allBytes.count
         var bnStart = 0, segCount = 1
@@ -3738,7 +3902,6 @@ final class SearchEngine: @unchecked Sendable {
             extIDs.append(eid)
             pathMetadata.append(metadata)
         }
-        pathToID[path] = id
         return id
     }
 
